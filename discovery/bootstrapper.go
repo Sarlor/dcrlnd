@@ -4,21 +4,29 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	prand "math/rand"
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcutil/bech32"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/tor"
 	"github.com/miekg/dns"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcutil/bech32"
 )
 
+func init() {
+	prand.Seed(time.Now().Unix())
+}
+
 // NetworkPeerBootstrapper is an interface that represents an initial peer
-// boostrap mechanism. This interface is to be used to bootstrap a new peer to
+// bootstrap mechanism. This interface is to be used to bootstrap a new peer to
 // the connection by providing it with the pubkey+address of a set of existing
 // peers on the network. Several bootstrap mechanisms can be implemented such
 // as DNS, in channel graph, DHT's, etc.
@@ -43,38 +51,62 @@ type NetworkPeerBootstrapper interface {
 // the ignore map is populated, then the bootstrappers will be instructed to
 // skip those nodes.
 func MultiSourceBootstrap(ignore map[autopilot.NodeID]struct{}, numAddrs uint32,
-	bootStrappers ...NetworkPeerBootstrapper) ([]*lnwire.NetAddress, error) {
+	bootstrappers ...NetworkPeerBootstrapper) ([]*lnwire.NetAddress, error) {
+
+	// We'll randomly shuffle our bootstrappers before querying them in
+	// order to avoid from querying the same bootstrapper method over and
+	// over, as some of these might tend to provide better/worse results
+	// than others.
+	bootstrappers = shuffleBootstrappers(bootstrappers)
 
 	var addrs []*lnwire.NetAddress
-	for _, bootStrapper := range bootStrappers {
+	for _, bootstrapper := range bootstrappers {
 		// If we already have enough addresses, then we can exit early
-		// w/o querying the additional boostrappers.
+		// w/o querying the additional bootstrappers.
 		if uint32(len(addrs)) >= numAddrs {
 			break
 		}
 
-		log.Infof("Attempting to bootstrap with: %v", bootStrapper.Name())
+		log.Infof("Attempting to bootstrap with: %v", bootstrapper.Name())
 
 		// If we still need additional addresses, then we'll compute
 		// the number of address remaining that we need to fetch.
 		numAddrsLeft := numAddrs - uint32(len(addrs))
 		log.Tracef("Querying for %v addresses", numAddrsLeft)
-		netAddrs, err := bootStrapper.SampleNodeAddrs(numAddrsLeft, ignore)
+		netAddrs, err := bootstrapper.SampleNodeAddrs(numAddrsLeft, ignore)
 		if err != nil {
 			// If we encounter an error with a bootstrapper, then
 			// we'll continue on to the next available
 			// bootstrapper.
 			log.Errorf("Unable to query bootstrapper %v: %v",
-				bootStrapper.Name(), err)
+				bootstrapper.Name(), err)
 			continue
 		}
 
 		addrs = append(addrs, netAddrs...)
 	}
 
+	if len(addrs) == 0 {
+		return nil, errors.New("no addresses found")
+	}
+
 	log.Infof("Obtained %v addrs to bootstrap network with", len(addrs))
 
 	return addrs, nil
+}
+
+// shuffleBootstrappers shuffles the set of bootstrappers in order to avoid
+// querying the same bootstrapper over and over. To shuffle the set of
+// candidates, we use a version of the Fisher–Yates shuffle algorithm.
+func shuffleBootstrappers(candidates []NetworkPeerBootstrapper) []NetworkPeerBootstrapper {
+	shuffled := make([]NetworkPeerBootstrapper, len(candidates))
+	perm := prand.Perm(len(candidates))
+
+	for i, v := range perm {
+		shuffled[v] = candidates[i]
+	}
+
+	return shuffled
 }
 
 // ChannelGraphBootstrapper is an implementation of the NetworkPeerBootstrapper
@@ -85,7 +117,7 @@ type ChannelGraphBootstrapper struct {
 	chanGraph autopilot.ChannelGraph
 
 	// hashAccumulator is a set of 32 random bytes that are read upon the
-	// creation of the channel graph boostrapper. We use this value to
+	// creation of the channel graph bootstrapper. We use this value to
 	// randomly select nodes within the known graph to connect to. After
 	// each selection, we rotate the accumulator by hashing it with itself.
 	hashAccumulator [32]byte
@@ -145,7 +177,7 @@ func (c *ChannelGraphBootstrapper) SampleNodeAddrs(numAddrs uint32,
 		)
 
 		err := c.chanGraph.ForEachNode(func(node autopilot.Node) error {
-			nID := autopilot.NewNodeID(node.PubKey())
+			nID := autopilot.NodeID(node.PubKey())
 			if _, ok := c.tried[nID]; ok {
 				return nil
 			}
@@ -155,8 +187,8 @@ func (c *ChannelGraphBootstrapper) SampleNodeAddrs(numAddrs uint32,
 			// value. When comparing, we skip the first byte as
 			// it's 50/50. If it isn't less, than then we'll
 			// continue forward.
-			nodePub := node.PubKey().SerializeCompressed()[1:]
-			if bytes.Compare(c.hashAccumulator[:], nodePub) > 0 {
+			nodePubKeyBytes := node.PubKey()
+			if bytes.Compare(c.hashAccumulator[:], nodePubKeyBytes[1:]) > 0 {
 				return nil
 			}
 
@@ -164,21 +196,28 @@ func (c *ChannelGraphBootstrapper) SampleNodeAddrs(numAddrs uint32,
 				// If we haven't yet reached our limit, then
 				// we'll copy over the details of this node
 				// into the set of addresses to be returned.
-				tcpAddr, ok := nodeAddr.(*net.TCPAddr)
-				if !ok {
-					// If this isn't a valid TCP address,
-					// then we'll ignore it as currently
-					// we'll only attempt to connect out to
-					// TCP peers.
+				switch nodeAddr.(type) {
+				case *net.TCPAddr, *tor.OnionAddr:
+				default:
+					// If this isn't a valid address
+					// supported by the protocol, then we'll
+					// skip this node.
 					return nil
+				}
+
+				nodePub, err := btcec.ParsePubKey(
+					nodePubKeyBytes[:], btcec.S256(),
+				)
+				if err != nil {
+					return err
 				}
 
 				// At this point, we've found an eligible node,
 				// so we'll return early with our shibboleth
 				// error.
 				a = append(a, &lnwire.NetAddress{
-					IdentityKey: node.PubKey(),
-					Address:     tcpAddr,
+					IdentityKey: nodePub,
+					Address:     nodeAddr,
 				})
 			}
 
@@ -247,6 +286,11 @@ type DNSSeedBootstrapper struct {
 	// receive the IP address of the current authoritative DNS server for
 	// the network seed.
 	dnsSeeds [][2]string
+	net      tor.Net
+
+	// timeout is the maximum amount of time a dial will wait for a connect to
+	// complete.
+	timeout time.Duration
 }
 
 // A compile time assertion to ensure that DNSSeedBootstrapper meets the
@@ -255,18 +299,15 @@ var _ NetworkPeerBootstrapper = (*ChannelGraphBootstrapper)(nil)
 
 // NewDNSSeedBootstrapper returns a new instance of the DNSSeedBootstrapper.
 // The set of passed seeds should point to DNS servers that properly implement
-// Lighting's DNS peer bootstrapping protocol as defined in BOLT-0010. The set
+// Lightning's DNS peer bootstrapping protocol as defined in BOLT-0010. The set
 // of passed DNS seeds should come in pairs, with the second host name to be
 // used as a fallback for manual TCP resolution in the case of an error
 // receiving the UDP response. The second host should return a single A record
 // with the IP address of the authoritative name server.
-//
-// TODO(roasbeef): add a lookUpFunc param to pass in, so can divert queries
-// over Tor in future
-func NewDNSSeedBootstrapper(seeds [][2]string) (NetworkPeerBootstrapper, error) {
-	return &DNSSeedBootstrapper{
-		dnsSeeds: seeds,
-	}, nil
+func NewDNSSeedBootstrapper(
+	seeds [][2]string, net tor.Net,
+	timeout time.Duration) NetworkPeerBootstrapper {
+	return &DNSSeedBootstrapper{dnsSeeds: seeds, net: net, timeout: timeout}
 }
 
 // fallBackSRVLookup attempts to manually query for SRV records we need to
@@ -275,13 +316,16 @@ func NewDNSSeedBootstrapper(seeds [][2]string) (NetworkPeerBootstrapper, error) 
 // address of the authoritative DNS server. Once we have this IP address, we'll
 // connect manually over TCP to request the SRV record. This is necessary as
 // the records we return are currently too large for a class of resolvers,
-// causing them to be filtered out.
-func fallBackSRVLookup(soaShim string) ([]*net.SRV, error) {
+// causing them to be filtered out. The targetEndPoint is the original end
+// point that was meant to be hit.
+func (d *DNSSeedBootstrapper) fallBackSRVLookup(soaShim string,
+	targetEndPoint string) ([]*net.SRV, error) {
+
 	log.Tracef("Attempting to query fallback DNS seed")
 
 	// First, we'll lookup the IP address of the server that will act as
 	// our shim.
-	addrs, err := net.LookupHost(soaShim)
+	addrs, err := d.net.LookupHost(soaShim)
 	if err != nil {
 		return nil, err
 	}
@@ -289,12 +333,12 @@ func fallBackSRVLookup(soaShim string) ([]*net.SRV, error) {
 	// Once we have the IP address, we'll establish a TCP connection using
 	// port 53.
 	dnsServer := net.JoinHostPort(addrs[0], "53")
-	conn, err := net.Dial("tcp", dnsServer)
+	conn, err := d.net.Dial("tcp", dnsServer, d.timeout)
 	if err != nil {
 		return nil, err
 	}
 
-	dnsHost := "_nodes._tcp.nodes.lightning.directory."
+	dnsHost := fmt.Sprintf("_nodes._tcp.%v.", targetEndPoint)
 	dnsConn := &dns.Conn{Conn: conn}
 	defer dnsConn.Close()
 
@@ -312,7 +356,7 @@ func fallBackSRVLookup(soaShim string) ([]*net.SRV, error) {
 
 	// If the message response code was not the success code, fail.
 	if resp.Rcode != dns.RcodeSuccess {
-		return nil, fmt.Errorf("Unsuccessful SRV request, "+
+		return nil, fmt.Errorf("unsuccessful SRV request, "+
 			"received: %v", resp.Rcode)
 	}
 
@@ -341,127 +385,148 @@ func (d *DNSSeedBootstrapper) SampleNodeAddrs(numAddrs uint32,
 
 	var netAddrs []*lnwire.NetAddress
 
-	// We'll continue this loop until we reach our target address limit.
-	// Each SRV query to the seed will return 25 random nodes, so we can
-	// continue to query until we reach our target.
+	// We'll try all the registered DNS seeds, exiting early if one of them
+	// gives us all the peers we need.
+	//
+	// TODO(roasbeef): should combine results from both
 search:
-	for uint32(len(netAddrs)) < numAddrs {
-		for _, dnsSeedTuple := range d.dnsSeeds {
-			// We'll first query the seed with an SRV record so we
-			// can obtain a random sample of the encoded public
-			// keys of nodes.
-			primarySeed := dnsSeedTuple[0]
-			_, addrs, err := net.LookupSRV("nodes", "tcp", primarySeed)
-			if err != nil {
-				log.Tracef("Unable to lookup SRV records via " +
-					"primary seed, falling back to secondary")
+	for _, dnsSeedTuple := range d.dnsSeeds {
+		// We'll first query the seed with an SRV record so we can
+		// obtain a random sample of the encoded public keys of nodes.
+		// We use the lndLookupSRV function for this task.
+		primarySeed := dnsSeedTuple[0]
+		_, addrs, err := d.net.LookupSRV(
+			"nodes", "tcp", primarySeed, d.timeout,
+		)
+		if err != nil {
+			log.Tracef("Unable to lookup SRV records via "+
+				"primary seed (%v): %v", primarySeed, err)
 
-				// If the host of the secondary seed is blank,
-				// then we'll bail here as we can't proceed.
-				if dnsSeedTuple[1] == "" {
-					return nil, fmt.Errorf("Secondary seed is blank")
-				}
+			log.Trace("Falling back to secondary")
 
-				// If we get an error when trying to query via
-				// the primary seed, we'll fallback to the
-				// secondary seed before concluding failure.
-				secondarySeed := dnsSeedTuple[1]
-				addrs, err = fallBackSRVLookup(secondarySeed)
-				if err != nil {
-					return nil, err
-				}
-				log.Tracef("Successfully queried fallback DNS seed")
+			// If the host of the secondary seed is blank, then
+			// we'll bail here as we can't proceed.
+			if dnsSeedTuple[1] == "" {
+				log.Tracef("DNS seed %v has no secondary, "+
+					"skipping fallback", primarySeed)
+				continue
 			}
 
-			log.Tracef("Retrieved SRV records from dns seed: %v",
-				spew.Sdump(addrs))
+			// If we get an error when trying to query via the
+			// primary seed, we'll fallback to the secondary seed
+			// before concluding failure.
+			soaShim := dnsSeedTuple[1]
+			addrs, err = d.fallBackSRVLookup(
+				soaShim, primarySeed,
+			)
+			if err != nil {
+				log.Tracef("Unable to query fall "+
+					"back dns seed (%v): %v", soaShim, err)
+				continue
+			}
 
-			// Next, we'll need to issue an A record request for
-			// each of the nodes, skipping it if nothing comes
-			// back.
-			for _, nodeSrv := range addrs {
-				if uint32(len(netAddrs)) >= numAddrs {
-					break search
-				}
+			log.Tracef("Successfully queried fallback DNS seed")
+		}
 
-				// With the SRV target obtained, we'll now
-				// perform another query to obtain the IP
-				// address for the matching bech32 encoded node
-				// key.
-				bechNodeHost := nodeSrv.Target
-				addrs, err := net.LookupHost(bechNodeHost)
-				if err != nil {
-					return nil, err
-				}
+		log.Tracef("Retrieved SRV records from dns seed: %v",
+			newLogClosure(func() string {
+				return spew.Sdump(addrs)
+			}),
+		)
 
-				if len(addrs) == 0 {
-					log.Tracef("No addresses for %v, skipping",
-						bechNodeHost)
+		// Next, we'll need to issue an A record request for each of
+		// the nodes, skipping it if nothing comes back.
+		for _, nodeSrv := range addrs {
+			if uint32(len(netAddrs)) >= numAddrs {
+				break search
+			}
+
+			// With the SRV target obtained, we'll now perform
+			// another query to obtain the IP address for the
+			// matching bech32 encoded node key. We use the
+			// lndLookup function for this task.
+			bechNodeHost := nodeSrv.Target
+			addrs, err := d.net.LookupHost(bechNodeHost)
+			if err != nil {
+				return nil, err
+			}
+
+			if len(addrs) == 0 {
+				log.Tracef("No addresses for %v, skipping",
+					bechNodeHost)
+				continue
+			}
+
+			log.Tracef("Attempting to convert: %v", bechNodeHost)
+
+			// If the host isn't correctly formatted, then we'll
+			// skip it.
+			if len(bechNodeHost) == 0 ||
+				!strings.Contains(bechNodeHost, ".") {
+
+				continue
+			}
+
+			// If we have a set of valid addresses, then we'll need
+			// to parse the public key from the original bech32
+			// encoded string.
+			bechNode := strings.Split(bechNodeHost, ".")
+			_, nodeBytes5Bits, err := bech32.Decode(bechNode[0])
+			if err != nil {
+				return nil, err
+			}
+
+			// Once we have the bech32 decoded pubkey, we'll need
+			// to convert the 5-bit word grouping into our regular
+			// 8-bit word grouping so we can convert it into a
+			// public key.
+			nodeBytes, err := bech32.ConvertBits(
+				nodeBytes5Bits, 5, 8, false,
+			)
+			if err != nil {
+				return nil, err
+			}
+			nodeKey, err := btcec.ParsePubKey(
+				nodeBytes, btcec.S256(),
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			// If we have an ignore list, and this node is in the
+			// ignore list, then we'll go to the next candidate.
+			if ignore != nil {
+				nID := autopilot.NewNodeID(nodeKey)
+				if _, ok := ignore[nID]; ok {
 					continue
 				}
-
-				log.Tracef("Attempting to convert: %v", bechNodeHost)
-
-				// If we have a set of valid addresses, then
-				// we'll need to parse the public key from the
-				// original bech32 encoded string.
-				bechNode := strings.Split(bechNodeHost, ".")
-				_, nodeBytes5Bits, err := bech32.Decode(bechNode[0])
-				if err != nil {
-					return nil, err
-				}
-
-				// Once we have the bech32 decoded pubkey,
-				// we'll need to convert the 5-bit word
-				// grouping into our regular 8-bit word
-				// grouping so we can convert it into a public
-				// key.
-				nodeBytes, err := bech32.ConvertBits(
-					nodeBytes5Bits, 5, 8, false,
-				)
-				if err != nil {
-					return nil, err
-				}
-				nodeKey, err := btcec.ParsePubKey(
-					nodeBytes, btcec.S256(),
-				)
-				if err != nil {
-					return nil, err
-				}
-
-				// If we have an ignore list, and this node is
-				// in the ignore list, then we'll go to the
-				// next candidate.
-				if ignore != nil {
-					nID := autopilot.NewNodeID(nodeKey)
-					if _, ok := ignore[nID]; ok {
-						continue
-					}
-				}
-
-				// Finally we'll convert the host:port peer to
-				// a proper TCP address to use within the
-				// lnwire.NetAddress.
-				addr := net.JoinHostPort(addrs[0],
-					strconv.FormatUint(uint64(nodeSrv.Port), 10))
-				tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
-				if err != nil {
-					return nil, err
-				}
-
-				// Finally, with all the information parsed,
-				// we'll return this fully valid address as a
-				// connection attempt.
-				lnAddr := &lnwire.NetAddress{
-					IdentityKey: nodeKey,
-					Address:     tcpAddr,
-				}
-
-				log.Tracef("Obtained %v as valid reachable "+
-					"node", lnAddr)
-
-				netAddrs = append(netAddrs, lnAddr)
 			}
+
+			// Finally we'll convert the host:port peer to a proper
+			// TCP address to use within the lnwire.NetAddress. We
+			// don't need to use the lndResolveTCP function here
+			// because we already have the host:port peer.
+			addr := net.JoinHostPort(
+				addrs[0],
+				strconv.FormatUint(uint64(nodeSrv.Port), 10),
+			)
+			tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+			if err != nil {
+				return nil, err
+			}
+
+			// Finally, with all the information parsed, we'll
+			// return this fully valid address as a connection
+			// attempt.
+			lnAddr := &lnwire.NetAddress{
+				IdentityKey: nodeKey,
+				Address:     tcpAddr,
+			}
+
+			log.Tracef("Obtained %v as valid reachable "+
+				"node", lnAddr)
+
+			netAddrs = append(netAddrs, lnAddr)
 		}
 	}
 

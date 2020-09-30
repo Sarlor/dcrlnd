@@ -1,6 +1,7 @@
 package lnwire
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/go-errors/errors"
+	"github.com/lightningnetwork/lnd/tlv"
 )
 
 // FailureMessage represents the onion failure object identified by its unique
@@ -25,12 +27,12 @@ type FailureMessage interface {
 	Error() string
 }
 
-// failureMessageLength is the size of the failure message plus the size of
-// padding. The FailureMessage message should always be EXACLTY this size.
-const failureMessageLength = 256
+// FailureMessageLength is the size of the failure message plus the size of
+// padding. The FailureMessage message should always be EXACTLY this size.
+const FailureMessageLength = 256
 
 const (
-	// FlagBadOnion error flag describes an unparseable, encrypted by
+	// FlagBadOnion error flag describes an unparsable, encrypted by
 	// previous node.
 	FlagBadOnion FailCode = 0x8000
 
@@ -45,7 +47,7 @@ const (
 	FlagUpdate FailCode = 0x1000
 )
 
-// FailCode specifies the precise reason that an upstream HTLC was cancelled.
+// FailCode specifies the precise reason that an upstream HTLC was canceled.
 // Each UpdateFailHTLC message carries a FailCode which is to be passed
 // backwards, encrypted at each step back to the source of the HTLC within the
 // route.
@@ -54,28 +56,31 @@ type FailCode uint16
 // The currently defined onion failure types within this current version of the
 // Lightning protocol.
 const (
-	CodeNone                          FailCode = 0
-	CodeInvalidRealm                           = FlagBadOnion | 1
-	CodeTemporaryNodeFailure                   = FlagNode | 2
-	CodePermanentNodeFailure                   = FlagPerm | FlagNode | 2
-	CodeRequiredNodeFeatureMissing             = FlagPerm | FlagNode | 3
-	CodeInvalidOnionVersion                    = FlagBadOnion | FlagPerm | 4
-	CodeInvalidOnionHmac                       = FlagBadOnion | FlagPerm | 5
-	CodeInvalidOnionKey                        = FlagBadOnion | FlagPerm | 6
-	CodeTemporaryChannelFailure                = FlagUpdate | 7
-	CodePermanentChannelFailure                = FlagPerm | 8
-	CodeRequiredChannelFeatureMissing          = FlagPerm | 9
-	CodeUnknownNextPeer                        = FlagPerm | 10
-	CodeAmountBelowMinimum                     = FlagUpdate | 11
-	CodeFeeInsufficient                        = FlagUpdate | 12
-	CodeIncorrectCltvExpiry                    = FlagUpdate | 13
-	CodeExpiryTooSoon                          = FlagUpdate | 14
-	CodeChannelDisabled                        = FlagUpdate | 20
-	CodeUnknownPaymentHash                     = FlagPerm | 15
-	CodeIncorrectPaymentAmount                 = FlagPerm | 16
-	CodeFinalExpiryTooSoon            FailCode = 17
-	CodeFinalIncorrectCltvExpiry      FailCode = 18
-	CodeFinalIncorrectHtlcAmount      FailCode = 19
+	CodeNone                             FailCode = 0
+	CodeInvalidRealm                              = FlagBadOnion | 1
+	CodeTemporaryNodeFailure                      = FlagNode | 2
+	CodePermanentNodeFailure                      = FlagPerm | FlagNode | 2
+	CodeRequiredNodeFeatureMissing                = FlagPerm | FlagNode | 3
+	CodeInvalidOnionVersion                       = FlagBadOnion | FlagPerm | 4
+	CodeInvalidOnionHmac                          = FlagBadOnion | FlagPerm | 5
+	CodeInvalidOnionKey                           = FlagBadOnion | FlagPerm | 6
+	CodeTemporaryChannelFailure                   = FlagUpdate | 7
+	CodePermanentChannelFailure                   = FlagPerm | 8
+	CodeRequiredChannelFeatureMissing             = FlagPerm | 9
+	CodeUnknownNextPeer                           = FlagPerm | 10
+	CodeAmountBelowMinimum                        = FlagUpdate | 11
+	CodeFeeInsufficient                           = FlagUpdate | 12
+	CodeIncorrectCltvExpiry                       = FlagUpdate | 13
+	CodeExpiryTooSoon                             = FlagUpdate | 14
+	CodeChannelDisabled                           = FlagUpdate | 20
+	CodeIncorrectOrUnknownPaymentDetails          = FlagPerm | 15
+	CodeIncorrectPaymentAmount                    = FlagPerm | 16
+	CodeFinalExpiryTooSoon               FailCode = 17
+	CodeFinalIncorrectCltvExpiry         FailCode = 18
+	CodeFinalIncorrectHtlcAmount         FailCode = 19
+	CodeExpiryTooFar                     FailCode = 21
+	CodeInvalidOnionPayload                       = FlagPerm | 22
+	CodeMPPTimeout                       FailCode = 23
 )
 
 // String returns the string representation of the failure code.
@@ -123,17 +128,17 @@ func (c FailCode) String() string {
 	case CodeIncorrectCltvExpiry:
 		return "IncorrectCltvExpiry"
 
+	case CodeIncorrectPaymentAmount:
+		return "IncorrectPaymentAmount"
+
 	case CodeExpiryTooSoon:
 		return "ExpiryTooSoon"
 
 	case CodeChannelDisabled:
 		return "ChannelDisabled"
 
-	case CodeUnknownPaymentHash:
-		return "UnknownPaymentHash"
-
-	case CodeIncorrectPaymentAmount:
-		return "IncorrectPaymentAmount"
+	case CodeIncorrectOrUnknownPaymentDetails:
+		return "IncorrectOrUnknownPaymentDetails"
 
 	case CodeFinalExpiryTooSoon:
 		return "FinalExpiryTooSoon"
@@ -143,6 +148,15 @@ func (c FailCode) String() string {
 
 	case CodeFinalIncorrectHtlcAmount:
 		return "FinalIncorrectHtlcAmount"
+
+	case CodeExpiryTooFar:
+		return "ExpiryTooFar"
+
+	case CodeInvalidOnionPayload:
+		return "InvalidOnionPayload"
+
+	case CodeMPPTimeout:
+		return "MPPTimeout"
 
 	default:
 		return "<unknown>"
@@ -157,14 +171,14 @@ type FailInvalidRealm struct{}
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailInvalidRealm) Error() string {
+func (f *FailInvalidRealm) Error() string {
 	return f.Code().String()
 }
 
 // Code returns the failure unique code.
 //
 // NOTE: Part of the FailureMessage interface.
-func (f FailInvalidRealm) Code() FailCode {
+func (f *FailInvalidRealm) Code() FailCode {
 	return CodeInvalidRealm
 }
 
@@ -176,14 +190,14 @@ type FailTemporaryNodeFailure struct{}
 
 // Code returns the failure unique code.
 // NOTE: Part of the FailureMessage interface.
-func (f FailTemporaryNodeFailure) Code() FailCode {
+func (f *FailTemporaryNodeFailure) Code() FailCode {
 	return CodeTemporaryNodeFailure
 }
 
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailTemporaryNodeFailure) Error() string {
+func (f *FailTemporaryNodeFailure) Error() string {
 	return f.Code().String()
 }
 
@@ -196,14 +210,14 @@ type FailPermanentNodeFailure struct{}
 // Code returns the failure unique code.
 //
 // NOTE: Part of the FailureMessage interface.
-func (f FailPermanentNodeFailure) Code() FailCode {
+func (f *FailPermanentNodeFailure) Code() FailCode {
 	return CodePermanentNodeFailure
 }
 
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailPermanentNodeFailure) Error() string {
+func (f *FailPermanentNodeFailure) Error() string {
 	return f.Code().String()
 }
 
@@ -217,14 +231,14 @@ type FailRequiredNodeFeatureMissing struct{}
 // Code returns the failure unique code.
 //
 // NOTE: Part of the FailureMessage interface.
-func (f FailRequiredNodeFeatureMissing) Code() FailCode {
+func (f *FailRequiredNodeFeatureMissing) Code() FailCode {
 	return CodeRequiredNodeFeatureMissing
 }
 
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailRequiredNodeFeatureMissing) Error() string {
+func (f *FailRequiredNodeFeatureMissing) Error() string {
 	return f.Code().String()
 }
 
@@ -237,14 +251,14 @@ type FailPermanentChannelFailure struct{}
 // Code returns the failure unique code.
 //
 // NOTE: Part of the FailureMessage interface.
-func (f FailPermanentChannelFailure) Code() FailCode {
+func (f *FailPermanentChannelFailure) Code() FailCode {
 	return CodePermanentChannelFailure
 }
 
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailPermanentChannelFailure) Error() string {
+func (f *FailPermanentChannelFailure) Error() string {
 	return f.Code().String()
 }
 
@@ -258,14 +272,14 @@ type FailRequiredChannelFeatureMissing struct{}
 // Code returns the failure unique code.
 //
 // NOTE: Part of the FailureMessage interface.
-func (f FailRequiredChannelFeatureMissing) Code() FailCode {
+func (f *FailRequiredChannelFeatureMissing) Code() FailCode {
 	return CodeRequiredChannelFeatureMissing
 }
 
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailRequiredChannelFeatureMissing) Error() string {
+func (f *FailRequiredChannelFeatureMissing) Error() string {
 	return f.Code().String()
 }
 
@@ -278,36 +292,14 @@ type FailUnknownNextPeer struct{}
 // Code returns the failure unique code.
 //
 // NOTE: Part of the FailureMessage interface.
-func (f FailUnknownNextPeer) Code() FailCode {
+func (f *FailUnknownNextPeer) Code() FailCode {
 	return CodeUnknownNextPeer
 }
 
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailUnknownNextPeer) Error() string {
-	return f.Code().String()
-}
-
-// FailUnknownPaymentHash is returned If the payment hash has already been
-// paid, the final node MAY treat the payment hash as unknown, or may succeed
-// in accepting the HTLC. If the payment hash is unknown, the final node MUST
-// fail the HTLC.
-//
-// NOTE: May only be returned by the final node in the path.
-type FailUnknownPaymentHash struct{}
-
-// Code returns the failure unique code.
-//
-// NOTE: Part of the FailureMessage interface.
-func (f FailUnknownPaymentHash) Code() FailCode {
-	return CodeUnknownPaymentHash
-}
-
-// Returns a human readable string describing the target FailureMessage.
-//
-// NOTE: Implements the error interface.
-func (f FailUnknownPaymentHash) Error() string {
+func (f *FailUnknownNextPeer) Error() string {
 	return f.Code().String()
 }
 
@@ -323,15 +315,112 @@ type FailIncorrectPaymentAmount struct{}
 // Code returns the failure unique code.
 //
 // NOTE: Part of the FailureMessage interface.
-func (f FailIncorrectPaymentAmount) Code() FailCode {
+func (f *FailIncorrectPaymentAmount) Code() FailCode {
 	return CodeIncorrectPaymentAmount
 }
 
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailIncorrectPaymentAmount) Error() string {
+func (f *FailIncorrectPaymentAmount) Error() string {
 	return f.Code().String()
+}
+
+// FailIncorrectDetails is returned for two reasons:
+//
+// 1) if the payment hash has already been paid, the final node MAY treat the
+// payment hash as unknown, or may succeed in accepting the HTLC. If the
+// payment hash is unknown, the final node MUST fail the HTLC.
+//
+// 2) if the amount paid is less than the amount expected, the final node MUST
+// fail the HTLC. If the amount paid is more than twice the amount expected,
+// the final node SHOULD fail the HTLC. This allows the sender to reduce
+// information leakage by altering the amount, without allowing accidental
+// gross overpayment.
+//
+// NOTE: May only be returned by the final node in the path.
+type FailIncorrectDetails struct {
+	// amount is the value of the extended HTLC.
+	amount MilliSatoshi
+
+	// height is the block height when the htlc was received.
+	height uint32
+}
+
+// NewFailIncorrectDetails makes a new instance of the FailIncorrectDetails
+// error bound to the specified HTLC amount and acceptance height.
+func NewFailIncorrectDetails(amt MilliSatoshi,
+	height uint32) *FailIncorrectDetails {
+
+	return &FailIncorrectDetails{
+		amount: amt,
+		height: height,
+	}
+}
+
+// Amount is the value of the extended HTLC.
+func (f *FailIncorrectDetails) Amount() MilliSatoshi {
+	return f.amount
+}
+
+// Height is the block height when the htlc was received.
+func (f *FailIncorrectDetails) Height() uint32 {
+	return f.height
+}
+
+// Code returns the failure unique code.
+//
+// NOTE: Part of the FailureMessage interface.
+func (f *FailIncorrectDetails) Code() FailCode {
+	return CodeIncorrectOrUnknownPaymentDetails
+}
+
+// Returns a human readable string describing the target FailureMessage.
+//
+// NOTE: Implements the error interface.
+func (f *FailIncorrectDetails) Error() string {
+	return fmt.Sprintf(
+		"%v(amt=%v, height=%v)", CodeIncorrectOrUnknownPaymentDetails,
+		f.amount, f.height,
+	)
+}
+
+// Decode decodes the failure from bytes stream.
+//
+// NOTE: Part of the Serializable interface.
+func (f *FailIncorrectDetails) Decode(r io.Reader, pver uint32) error {
+	err := ReadElement(r, &f.amount)
+	switch {
+	// This is an optional tack on that was added later in the protocol. As
+	// a result, older nodes may not include this value. We'll account for
+	// this by checking for io.EOF here which means that no bytes were read
+	// at all.
+	case err == io.EOF:
+		return nil
+
+	case err != nil:
+		return err
+	}
+
+	// At a later stage, the height field was also tacked on. We need to
+	// check for io.EOF here as well.
+	err = ReadElement(r, &f.height)
+	switch {
+	case err == io.EOF:
+		return nil
+
+	case err != nil:
+		return err
+	}
+
+	return nil
+}
+
+// Encode writes the failure in bytes stream.
+//
+// NOTE: Part of the Serializable interface.
+func (f *FailIncorrectDetails) Encode(w io.Writer, pver uint32) error {
+	return WriteElements(w, f.amount, f.height)
 }
 
 // FailFinalExpiryTooSoon is returned if the cltv_expiry is too low, the final
@@ -343,15 +432,20 @@ type FailFinalExpiryTooSoon struct{}
 // Code returns the failure unique code.
 //
 // NOTE: Part of the FailureMessage interface.
-func (f FailFinalExpiryTooSoon) Code() FailCode {
+func (f *FailFinalExpiryTooSoon) Code() FailCode {
 	return CodeFinalExpiryTooSoon
 }
 
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailFinalExpiryTooSoon) Error() string {
+func (f *FailFinalExpiryTooSoon) Error() string {
 	return f.Code().String()
+}
+
+// NewFinalExpiryTooSoon creates new instance of the FailFinalExpiryTooSoon.
+func NewFinalExpiryTooSoon() *FailFinalExpiryTooSoon {
+	return &FailFinalExpiryTooSoon{}
 }
 
 // FailInvalidOnionVersion is returned if the onion version byte is unknown.
@@ -365,7 +459,7 @@ type FailInvalidOnionVersion struct {
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailInvalidOnionVersion) Error() string {
+func (f *FailInvalidOnionVersion) Error() string {
 	return fmt.Sprintf("InvalidOnionVersion(onion_sha=%x)", f.OnionSHA256[:])
 }
 
@@ -385,14 +479,14 @@ func (f *FailInvalidOnionVersion) Code() FailCode {
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailInvalidOnionVersion) Decode(r io.Reader, pver uint32) error {
-	return readElement(r, f.OnionSHA256[:])
+	return ReadElement(r, f.OnionSHA256[:])
 }
 
 // Encode writes the failure in bytes stream.
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailInvalidOnionVersion) Encode(w io.Writer, pver uint32) error {
-	return writeElement(w, f.OnionSHA256[:])
+	return WriteElement(w, f.OnionSHA256[:])
 }
 
 // FailInvalidOnionHmac is return if the onion HMAC is incorrect.
@@ -419,20 +513,20 @@ func (f *FailInvalidOnionHmac) Code() FailCode {
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailInvalidOnionHmac) Decode(r io.Reader, pver uint32) error {
-	return readElement(r, f.OnionSHA256[:])
+	return ReadElement(r, f.OnionSHA256[:])
 }
 
 // Encode writes the failure in bytes stream.
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailInvalidOnionHmac) Encode(w io.Writer, pver uint32) error {
-	return writeElement(w, f.OnionSHA256[:])
+	return WriteElement(w, f.OnionSHA256[:])
 }
 
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailInvalidOnionHmac) Error() string {
+func (f *FailInvalidOnionHmac) Error() string {
 	return fmt.Sprintf("InvalidOnionHMAC(onion_sha=%x)", f.OnionSHA256[:])
 }
 
@@ -461,21 +555,59 @@ func (f *FailInvalidOnionKey) Code() FailCode {
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailInvalidOnionKey) Decode(r io.Reader, pver uint32) error {
-	return readElement(r, f.OnionSHA256[:])
+	return ReadElement(r, f.OnionSHA256[:])
 }
 
 // Encode writes the failure in bytes stream.
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailInvalidOnionKey) Encode(w io.Writer, pver uint32) error {
-	return writeElement(w, f.OnionSHA256[:])
+	return WriteElement(w, f.OnionSHA256[:])
 }
 
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailInvalidOnionKey) Error() string {
+func (f *FailInvalidOnionKey) Error() string {
 	return fmt.Sprintf("InvalidOnionKey(onion_sha=%x)", f.OnionSHA256[:])
+}
+
+// parseChannelUpdateCompatabilityMode will attempt to parse a channel updated
+// encoded into an onion error payload in two ways. First, we'll try the
+// compatibility oriented version wherein we'll _skip_ the length prefixing on
+// the channel update message. Older versions of c-lighting do this so we'll
+// attempt to parse these messages in order to retain compatibility. If we're
+// unable to pull out a fully valid version, then we'll fall back to the
+// regular parsing mechanism which includes the length prefix an NO type byte.
+func parseChannelUpdateCompatabilityMode(r *bufio.Reader,
+	chanUpdate *ChannelUpdate, pver uint32) error {
+
+	// We'll peek out two bytes from the buffer without advancing the
+	// buffer so we can decide how to parse the remainder of it.
+	maybeTypeBytes, err := r.Peek(2)
+	if err != nil {
+		return err
+	}
+
+	// Some nodes well prefix an additional set of bytes in front of their
+	// channel updates. These bytes will _almost_ always be 258 or the type
+	// of the ChannelUpdate message.
+	typeInt := binary.BigEndian.Uint16(maybeTypeBytes)
+	if typeInt == MsgChannelUpdate {
+		// At this point it's likely the case that this is a channel
+		// update message with its type prefixed, so we'll snip off the
+		// first two bytes and parse it as normal.
+		var throwAwayTypeBytes [2]byte
+		_, err := r.Read(throwAwayTypeBytes[:])
+		if err != nil {
+			return err
+		}
+	}
+
+	// At this pint, we've either decided to keep the entire thing, or snip
+	// off the first two bytes. In either case, we can just read it as
+	// normal.
+	return chanUpdate.Decode(r, pver)
 }
 
 // FailTemporaryChannelFailure is if an otherwise unspecified transient error
@@ -490,9 +622,6 @@ type FailTemporaryChannelFailure struct {
 	// NOTE: This field is optional.
 	Update *ChannelUpdate
 }
-
-// TODO(roasbeef): any error with an Update needs to include the edge+vertex of
-// failure
 
 // NewTemporaryChannelFailure creates new instance of the FailTemporaryChannelFailure.
 func NewTemporaryChannelFailure(update *ChannelUpdate) *FailTemporaryChannelFailure {
@@ -509,7 +638,7 @@ func (f *FailTemporaryChannelFailure) Code() FailCode {
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailTemporaryChannelFailure) Error() string {
+func (f *FailTemporaryChannelFailure) Error() string {
 	if f.Update == nil {
 		return f.Code().String()
 	}
@@ -523,14 +652,16 @@ func (f FailTemporaryChannelFailure) Error() string {
 // NOTE: Part of the Serializable interface.
 func (f *FailTemporaryChannelFailure) Decode(r io.Reader, pver uint32) error {
 	var length uint16
-	err := readElement(r, &length)
+	err := ReadElement(r, &length)
 	if err != nil {
 		return err
 	}
 
 	if length != 0 {
 		f.Update = &ChannelUpdate{}
-		return f.Update.Decode(r, pver)
+		return parseChannelUpdateCompatabilityMode(
+			bufio.NewReader(r), f.Update, pver,
+		)
 	}
 
 	return nil
@@ -549,7 +680,7 @@ func (f *FailTemporaryChannelFailure) Encode(w io.Writer, pver uint32) error {
 		payload = bw.Bytes()
 	}
 
-	if err := writeElement(w, uint16(len(payload))); err != nil {
+	if err := WriteElement(w, uint16(len(payload))); err != nil {
 		return err
 	}
 
@@ -591,7 +722,7 @@ func (f *FailAmountBelowMinimum) Code() FailCode {
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailAmountBelowMinimum) Error() string {
+func (f *FailAmountBelowMinimum) Error() string {
 	return fmt.Sprintf("AmountBelowMinimum(amt=%v, update=%v", f.HtlcMsat,
 		spew.Sdump(f.Update))
 }
@@ -600,33 +731,30 @@ func (f FailAmountBelowMinimum) Error() string {
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailAmountBelowMinimum) Decode(r io.Reader, pver uint32) error {
-	if err := readElement(r, &f.HtlcMsat); err != nil {
+	if err := ReadElement(r, &f.HtlcMsat); err != nil {
 		return err
 	}
 
 	var length uint16
-	if err := readElement(r, &length); err != nil {
+	if err := ReadElement(r, &length); err != nil {
 		return err
 	}
 
 	f.Update = ChannelUpdate{}
-	return f.Update.Decode(r, pver)
+	return parseChannelUpdateCompatabilityMode(
+		bufio.NewReader(r), &f.Update, pver,
+	)
 }
 
 // Encode writes the failure in bytes stream.
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailAmountBelowMinimum) Encode(w io.Writer, pver uint32) error {
-	if err := writeElement(w, f.HtlcMsat); err != nil {
+	if err := WriteElement(w, f.HtlcMsat); err != nil {
 		return err
 	}
 
-	err := writeElement(w, uint16(f.Update.MaxPayloadLength(pver)))
-	if err != nil {
-		return err
-	}
-
-	return f.Update.Encode(w, pver)
+	return writeOnionErrorChanUpdate(w, &f.Update, pver)
 }
 
 // FailFeeInsufficient is returned if the HTLC does not pay sufficient fee, we
@@ -662,8 +790,8 @@ func (f *FailFeeInsufficient) Code() FailCode {
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailFeeInsufficient) Error() string {
-	return fmt.Sprintf("FeeInsufficient(fee=%v, update=%v", f.HtlcMsat,
+func (f *FailFeeInsufficient) Error() string {
+	return fmt.Sprintf("FeeInsufficient(htlc_amt==%v, update=%v", f.HtlcMsat,
 		spew.Sdump(f.Update))
 }
 
@@ -671,33 +799,30 @@ func (f FailFeeInsufficient) Error() string {
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailFeeInsufficient) Decode(r io.Reader, pver uint32) error {
-	if err := readElement(r, &f.HtlcMsat); err != nil {
+	if err := ReadElement(r, &f.HtlcMsat); err != nil {
 		return err
 	}
 
 	var length uint16
-	if err := readElement(r, &length); err != nil {
+	if err := ReadElement(r, &length); err != nil {
 		return err
 	}
 
 	f.Update = ChannelUpdate{}
-	return f.Update.Decode(r, pver)
+	return parseChannelUpdateCompatabilityMode(
+		bufio.NewReader(r), &f.Update, pver,
+	)
 }
 
 // Encode writes the failure in bytes stream.
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailFeeInsufficient) Encode(w io.Writer, pver uint32) error {
-	if err := writeElement(w, f.HtlcMsat); err != nil {
+	if err := WriteElement(w, f.HtlcMsat); err != nil {
 		return err
 	}
 
-	err := writeElement(w, uint16(f.Update.MaxPayloadLength(pver)))
-	if err != nil {
-		return err
-	}
-
-	return f.Update.Encode(w, pver)
+	return writeOnionErrorChanUpdate(w, &f.Update, pver)
 }
 
 // FailIncorrectCltvExpiry is returned if outgoing cltv value does not match
@@ -742,33 +867,30 @@ func (f *FailIncorrectCltvExpiry) Error() string {
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailIncorrectCltvExpiry) Decode(r io.Reader, pver uint32) error {
-	if err := readElement(r, &f.CltvExpiry); err != nil {
+	if err := ReadElement(r, &f.CltvExpiry); err != nil {
 		return err
 	}
 
 	var length uint16
-	if err := readElement(r, &length); err != nil {
+	if err := ReadElement(r, &length); err != nil {
 		return err
 	}
 
 	f.Update = ChannelUpdate{}
-	return f.Update.Decode(r, pver)
+	return parseChannelUpdateCompatabilityMode(
+		bufio.NewReader(r), &f.Update, pver,
+	)
 }
 
 // Encode writes the failure in bytes stream.
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailIncorrectCltvExpiry) Encode(w io.Writer, pver uint32) error {
-	if err := writeElement(w, f.CltvExpiry); err != nil {
+	if err := WriteElement(w, f.CltvExpiry); err != nil {
 		return err
 	}
 
-	err := writeElement(w, uint16(f.Update.MaxPayloadLength(pver)))
-	if err != nil {
-		return err
-	}
-
-	return f.Update.Encode(w, pver)
+	return writeOnionErrorChanUpdate(w, &f.Update, pver)
 }
 
 // FailExpiryTooSoon is returned if the ctlv-expiry is too near, we tell them
@@ -807,24 +929,21 @@ func (f *FailExpiryTooSoon) Error() string {
 // NOTE: Part of the Serializable interface.
 func (f *FailExpiryTooSoon) Decode(r io.Reader, pver uint32) error {
 	var length uint16
-	if err := readElement(r, &length); err != nil {
+	if err := ReadElement(r, &length); err != nil {
 		return err
 	}
 
 	f.Update = ChannelUpdate{}
-	return f.Update.Decode(r, pver)
+	return parseChannelUpdateCompatabilityMode(
+		bufio.NewReader(r), &f.Update, pver,
+	)
 }
 
 // Encode writes the failure in bytes stream.
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailExpiryTooSoon) Encode(w io.Writer, pver uint32) error {
-	err := writeElement(w, uint16(f.Update.MaxPayloadLength(pver)))
-	if err != nil {
-		return err
-	}
-
-	return f.Update.Encode(w, pver)
+	return writeOnionErrorChanUpdate(w, &f.Update, pver)
 }
 
 // FailChannelDisabled is returned if the channel is disabled, we tell them the
@@ -860,7 +979,7 @@ func (f *FailChannelDisabled) Code() FailCode {
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailChannelDisabled) Error() string {
+func (f *FailChannelDisabled) Error() string {
 	return fmt.Sprintf("ChannelDisabled(flags=%v, update=%v", f.Flags,
 		spew.Sdump(f.Update))
 }
@@ -869,33 +988,30 @@ func (f FailChannelDisabled) Error() string {
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailChannelDisabled) Decode(r io.Reader, pver uint32) error {
-	if err := readElement(r, &f.Flags); err != nil {
+	if err := ReadElement(r, &f.Flags); err != nil {
 		return err
 	}
 
 	var length uint16
-	if err := readElement(r, &length); err != nil {
+	if err := ReadElement(r, &length); err != nil {
 		return err
 	}
 
 	f.Update = ChannelUpdate{}
-	return f.Update.Decode(r, pver)
+	return parseChannelUpdateCompatabilityMode(
+		bufio.NewReader(r), &f.Update, pver,
+	)
 }
 
 // Encode writes the failure in bytes stream.
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailChannelDisabled) Encode(w io.Writer, pver uint32) error {
-	if err := writeElement(w, f.Flags); err != nil {
+	if err := WriteElement(w, f.Flags); err != nil {
 		return err
 	}
 
-	err := writeElement(w, uint16(f.Update.MaxPayloadLength(pver)))
-	if err != nil {
-		return err
-	}
-
-	return f.Update.Encode(w, pver)
+	return writeOnionErrorChanUpdate(w, &f.Update, pver)
 }
 
 // FailFinalIncorrectCltvExpiry is returned if the outgoing_cltv_value does not
@@ -911,7 +1027,7 @@ type FailFinalIncorrectCltvExpiry struct {
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailFinalIncorrectCltvExpiry) Error() string {
+func (f *FailFinalIncorrectCltvExpiry) Error() string {
 	return fmt.Sprintf("FinalIncorrectCltvExpiry(expiry=%v)", f.CltvExpiry)
 }
 
@@ -934,14 +1050,14 @@ func (f *FailFinalIncorrectCltvExpiry) Code() FailCode {
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailFinalIncorrectCltvExpiry) Decode(r io.Reader, pver uint32) error {
-	return readElement(r, &f.CltvExpiry)
+	return ReadElement(r, &f.CltvExpiry)
 }
 
 // Encode writes the failure in bytes stream.
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailFinalIncorrectCltvExpiry) Encode(w io.Writer, pver uint32) error {
-	return writeElement(w, f.CltvExpiry)
+	return WriteElement(w, f.CltvExpiry)
 }
 
 // FailFinalIncorrectHtlcAmount is returned if the amt_to_forward is higher
@@ -956,7 +1072,7 @@ type FailFinalIncorrectHtlcAmount struct {
 // Returns a human readable string describing the target FailureMessage.
 //
 // NOTE: Implements the error interface.
-func (f FailFinalIncorrectHtlcAmount) Error() string {
+func (f *FailFinalIncorrectHtlcAmount) Error() string {
 	return fmt.Sprintf("FinalIncorrectHtlcAmount(amt=%v)",
 		f.IncomingHTLCAmount)
 }
@@ -980,14 +1096,114 @@ func (f *FailFinalIncorrectHtlcAmount) Code() FailCode {
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailFinalIncorrectHtlcAmount) Decode(r io.Reader, pver uint32) error {
-	return readElement(r, &f.IncomingHTLCAmount)
+	return ReadElement(r, &f.IncomingHTLCAmount)
 }
 
 // Encode writes the failure in bytes stream.
 //
 // NOTE: Part of the Serializable interface.
 func (f *FailFinalIncorrectHtlcAmount) Encode(w io.Writer, pver uint32) error {
-	return writeElement(w, f.IncomingHTLCAmount)
+	return WriteElement(w, f.IncomingHTLCAmount)
+}
+
+// FailExpiryTooFar is returned if the CLTV expiry in the HTLC is too far in the
+// future.
+//
+// NOTE: May be returned by any node in the payment route.
+type FailExpiryTooFar struct{}
+
+// Code returns the failure unique code.
+//
+// NOTE: Part of the FailureMessage interface.
+func (f *FailExpiryTooFar) Code() FailCode {
+	return CodeExpiryTooFar
+}
+
+// Returns a human readable string describing the target FailureMessage.
+//
+// NOTE: Implements the error interface.
+func (f *FailExpiryTooFar) Error() string {
+	return f.Code().String()
+}
+
+// InvalidOnionPayload is returned if the hop could not process the TLV payload
+// enclosed in the onion.
+type InvalidOnionPayload struct {
+	// Type is the TLV type that caused the specific failure.
+	Type uint64
+
+	// Offset is the byte offset within the payload where the failure
+	// occurred.
+	Offset uint16
+}
+
+// NewInvalidOnionPayload initializes a new InvalidOnionPayload failure.
+func NewInvalidOnionPayload(typ uint64, offset uint16) *InvalidOnionPayload {
+	return &InvalidOnionPayload{
+		Type:   typ,
+		Offset: offset,
+	}
+}
+
+// Code returns the failure unique code.
+//
+// NOTE: Part of the FailureMessage interface.
+func (f *InvalidOnionPayload) Code() FailCode {
+	return CodeInvalidOnionPayload
+}
+
+// Returns a human readable string describing the target FailureMessage.
+//
+// NOTE: Implements the error interface.
+func (f *InvalidOnionPayload) Error() string {
+	return fmt.Sprintf("%v(type=%v, offset=%d)",
+		f.Code(), f.Type, f.Offset)
+}
+
+// Decode decodes the failure from bytes stream.
+//
+// NOTE: Part of the Serializable interface.
+func (f *InvalidOnionPayload) Decode(r io.Reader, pver uint32) error {
+	var buf [8]byte
+	typ, err := tlv.ReadVarInt(r, &buf)
+	if err != nil {
+		return err
+	}
+	f.Type = typ
+
+	return ReadElements(r, &f.Offset)
+}
+
+// Encode writes the failure in bytes stream.
+//
+// NOTE: Part of the Serializable interface.
+func (f *InvalidOnionPayload) Encode(w io.Writer, pver uint32) error {
+	var buf [8]byte
+	if err := tlv.WriteVarInt(w, f.Type, &buf); err != nil {
+		return err
+	}
+
+	return WriteElements(w, f.Offset)
+}
+
+// FailMPPTimeout is returned if the complete amount for a multi part payment
+// was not received within a reasonable time.
+//
+// NOTE: May only be returned by the final node in the path.
+type FailMPPTimeout struct{}
+
+// Code returns the failure unique code.
+//
+// NOTE: Part of the FailureMessage interface.
+func (f *FailMPPTimeout) Code() FailCode {
+	return CodeMPPTimeout
+}
+
+// Returns a human readable string describing the target FailureMessage.
+//
+// NOTE: Implements the error interface.
+func (f *FailMPPTimeout) Error() string {
+	return f.Code().String()
 }
 
 // DecodeFailure decodes, validates, and parses the lnwire onion failure, for
@@ -996,10 +1212,10 @@ func DecodeFailure(r io.Reader, pver uint32) (FailureMessage, error) {
 	// First, we'll parse out the encapsulated failure message itself. This
 	// is a 2 byte length followed by the payload itself.
 	var failureLength uint16
-	if err := readElement(r, &failureLength); err != nil {
+	if err := ReadElement(r, &failureLength); err != nil {
 		return nil, fmt.Errorf("unable to read error len: %v", err)
 	}
-	if failureLength > failureMessageLength {
+	if failureLength > FailureMessageLength {
 		return nil, fmt.Errorf("failure message is too "+
 			"long: %v", failureLength)
 	}
@@ -1011,10 +1227,16 @@ func DecodeFailure(r io.Reader, pver uint32) (FailureMessage, error) {
 
 	dataReader := bytes.NewReader(failureData)
 
+	return DecodeFailureMessage(dataReader, pver)
+}
+
+// DecodeFailureMessage decodes just the failure message, ignoring any padding
+// that may be present at the end.
+func DecodeFailureMessage(r io.Reader, pver uint32) (FailureMessage, error) {
 	// Once we have the failure data, we can obtain the failure code from
 	// the first two bytes of the buffer.
 	var codeBytes [2]byte
-	if _, err := io.ReadFull(dataReader, codeBytes[:]); err != nil {
+	if _, err := io.ReadFull(r, codeBytes[:]); err != nil {
 		return nil, fmt.Errorf("unable to read failure code: %v", err)
 	}
 	failCode := FailCode(binary.BigEndian.Uint16(codeBytes[:]))
@@ -1030,10 +1252,9 @@ func DecodeFailure(r io.Reader, pver uint32) (FailureMessage, error) {
 	// well.
 	switch f := failure.(type) {
 	case Serializable:
-		if err := f.Decode(dataReader, pver); err != nil {
+		if err := f.Decode(r, pver); err != nil {
 			return nil, fmt.Errorf("unable to decode error "+
-				"update (type=%T, len_bytes=%v, bytes=%x): %v",
-				failure, failureLength, failureData[:], err)
+				"update (type=%T): %v", failure, err)
 		}
 	}
 
@@ -1045,12 +1266,40 @@ func DecodeFailure(r io.Reader, pver uint32) (FailureMessage, error) {
 func EncodeFailure(w io.Writer, failure FailureMessage, pver uint32) error {
 	var failureMessageBuffer bytes.Buffer
 
+	err := EncodeFailureMessage(&failureMessageBuffer, failure, pver)
+	if err != nil {
+		return err
+	}
+
+	// The combined size of this message must be below the max allowed
+	// failure message length.
+	failureMessage := failureMessageBuffer.Bytes()
+	if len(failureMessage) > FailureMessageLength {
+		return fmt.Errorf("failure message exceed max "+
+			"available size: %v", len(failureMessage))
+	}
+
+	// Finally, we'll add some padding in order to ensure that all failure
+	// messages are fixed size.
+	pad := make([]byte, FailureMessageLength-len(failureMessage))
+
+	return WriteElements(w,
+		uint16(len(failureMessage)),
+		failureMessage,
+		uint16(len(pad)),
+		pad,
+	)
+}
+
+// EncodeFailureMessage encodes just the failure message without adding a length
+// and padding the message for the onion protocol.
+func EncodeFailureMessage(w io.Writer, failure FailureMessage, pver uint32) error {
 	// First, we'll write out the error code itself into the failure
 	// buffer.
 	var codeBytes [2]byte
 	code := uint16(failure.Code())
 	binary.BigEndian.PutUint16(codeBytes[:], code)
-	_, err := failureMessageBuffer.Write(codeBytes[:])
+	_, err := w.Write(codeBytes[:])
 	if err != nil {
 		return err
 	}
@@ -1060,29 +1309,12 @@ func EncodeFailure(w io.Writer, failure FailureMessage, pver uint32) error {
 	// well.
 	switch failure := failure.(type) {
 	case Serializable:
-		if err := failure.Encode(&failureMessageBuffer, pver); err != nil {
+		if err := failure.Encode(w, pver); err != nil {
 			return err
 		}
 	}
 
-	// The combined size of this message must be below the max allowed
-	// failure message length.
-	failureMessage := failureMessageBuffer.Bytes()
-	if len(failureMessage) > failureMessageLength {
-		return fmt.Errorf("failure message exceed max "+
-			"available size: %v", len(failureMessage))
-	}
-
-	// Finally, we'll add some padding in order to ensure that all failure
-	// messages are fixed size.
-	pad := make([]byte, failureMessageLength-len(failureMessage))
-
-	return writeElements(w,
-		uint16(len(failureMessage)),
-		failureMessage,
-		uint16(len(pad)),
-		pad,
-	)
+	return nil
 }
 
 // makeEmptyOnionError creates a new empty onion error  of the proper concrete
@@ -1110,8 +1342,8 @@ func makeEmptyOnionError(code FailCode) (FailureMessage, error) {
 	case CodeUnknownNextPeer:
 		return &FailUnknownNextPeer{}, nil
 
-	case CodeUnknownPaymentHash:
-		return &FailUnknownPaymentHash{}, nil
+	case CodeIncorrectOrUnknownPaymentDetails:
+		return &FailIncorrectDetails{}, nil
 
 	case CodeIncorrectPaymentAmount:
 		return &FailIncorrectPaymentAmount{}, nil
@@ -1151,7 +1383,46 @@ func makeEmptyOnionError(code FailCode) (FailureMessage, error) {
 
 	case CodeFinalIncorrectHtlcAmount:
 		return &FailFinalIncorrectHtlcAmount{}, nil
+
+	case CodeExpiryTooFar:
+		return &FailExpiryTooFar{}, nil
+
+	case CodeInvalidOnionPayload:
+		return &InvalidOnionPayload{}, nil
+
+	case CodeMPPTimeout:
+		return &FailMPPTimeout{}, nil
+
 	default:
 		return nil, errors.Errorf("unknown error code: %v", code)
 	}
+}
+
+// writeOnionErrorChanUpdate writes out a ChannelUpdate using the onion error
+// format. The format is that we first write out the true serialized length of
+// the channel update, followed by the serialized channel update itself.
+func writeOnionErrorChanUpdate(w io.Writer, chanUpdate *ChannelUpdate,
+	pver uint32) error {
+
+	// First, we encode the channel update in a temporary buffer in order
+	// to get the exact serialized size.
+	var b bytes.Buffer
+	if err := chanUpdate.Encode(&b, pver); err != nil {
+		return err
+	}
+
+	// Now that we know the size, we can write the length out in the main
+	// writer.
+	updateLen := b.Len()
+	if err := WriteElement(w, uint16(updateLen)); err != nil {
+		return err
+	}
+
+	// With the length written, we'll then write out the serialized channel
+	// update.
+	if _, err := w.Write(b.Bytes()); err != nil {
+		return err
+	}
+
+	return nil
 }

@@ -4,35 +4,133 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/lightningnetwork/lightning-onion"
+	sphinx "github.com/lightningnetwork/lightning-onion"
+	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/roasbeef/btcd/btcec"
 )
+
+// ClearTextError is an interface which is implemented by errors that occur
+// when we know the underlying wire failure message. These errors are the
+// opposite to opaque errors which are onion-encrypted blobs only understandable
+// to the initiating node. ClearTextErrors are used when we fail a htlc at our
+// node, or one of our initiated payments failed and we can decrypt the onion
+// encrypted error fully.
+type ClearTextError interface {
+	error
+
+	// WireMessage extracts a valid wire failure message from an internal
+	// error which may contain additional metadata (which should not be
+	// exposed to the network). This value may be nil in the case where
+	// an unknown wire error is returned by one of our peers.
+	WireMessage() lnwire.FailureMessage
+}
+
+// LinkError is an implementation of the ClearTextError interface which
+// represents failures that occur on our incoming or outgoing link.
+type LinkError struct {
+	// msg returns the wire failure associated with the error.
+	// This value should *not* be nil, because we should always
+	// know the failure type for failures which occur at our own
+	// node.
+	msg lnwire.FailureMessage
+
+	// FailureDetail enriches the wire error with additional information.
+	FailureDetail
+}
+
+// NewLinkError returns a LinkError with the failure message provided.
+// The failure message provided should *not* be nil, because we should
+// always know the failure type for failures which occur at our own node.
+func NewLinkError(msg lnwire.FailureMessage) *LinkError {
+	return &LinkError{msg: msg}
+}
+
+// NewDetailedLinkError returns a link error that enriches a wire message with
+// a failure detail.
+func NewDetailedLinkError(msg lnwire.FailureMessage,
+	detail FailureDetail) *LinkError {
+
+	return &LinkError{
+		msg:           msg,
+		FailureDetail: detail,
+	}
+}
+
+// WireMessage extracts a valid wire failure message from an internal
+// error which may contain additional metadata (which should not be
+// exposed to the network). This value should never be nil for LinkErrors,
+// because we are the ones failing the htlc.
+//
+// Note this is part of the ClearTextError interface.
+func (l *LinkError) WireMessage() lnwire.FailureMessage {
+	return l.msg
+}
+
+// Error returns the string representation of a link error.
+//
+// Note this is part of the ClearTextError interface.
+func (l *LinkError) Error() string {
+	// If the link error has no failure detail, return the wire message's
+	// error.
+	if l.FailureDetail == nil {
+		return l.msg.Error()
+	}
+
+	return l.FailureDetail.FailureString()
+}
 
 // ForwardingError wraps an lnwire.FailureMessage in a struct that also
 // includes the source of the error.
 type ForwardingError struct {
-	// ErrorSource is the public key of the node that sent the error. With
-	// this information, the dispatcher of a payment can modify their set
-	// of candidate routes in response to the type of error extracted.
-	ErrorSource *btcec.PublicKey
+	// FailureSourceIdx is the index of the node that sent the failure. With
+	// this information, the dispatcher of a payment can modify their set of
+	// candidate routes in response to the type of failure extracted. Index
+	// zero is the self node.
+	FailureSourceIdx int
 
-	// ExtraMsg is an additional error message that callers can provide in
-	// order to provide context specific error details.
-	ExtraMsg string
+	// msg is the wire message associated with the error. This value may
+	// be nil in the case where we fail to decode failure message sent by
+	// a peer.
+	msg lnwire.FailureMessage
+}
 
-	lnwire.FailureMessage
+// WireMessage extracts a valid wire failure message from an internal
+// error which may contain additional metadata (which should not be
+// exposed to the network). This value may be nil in the case where
+// an unknown wire error is returned by one of our peers.
+//
+// Note this is part of the ClearTextError interface.
+func (f *ForwardingError) WireMessage() lnwire.FailureMessage {
+	return f.msg
 }
 
 // Error implements the built-in error interface. We use this method to allow
 // the switch or any callers to insert additional context to the error message
 // returned.
 func (f *ForwardingError) Error() string {
-	if f.ExtraMsg == "" {
-		return f.FailureMessage.Error()
-	}
+	return fmt.Sprintf(
+		"%v@%v", f.msg, f.FailureSourceIdx,
+	)
+}
 
-	return fmt.Sprintf("%v: %v", f.FailureMessage.Error(), f.ExtraMsg)
+// NewForwardingError creates a new payment error which wraps a wire error
+// with additional metadata.
+func NewForwardingError(failure lnwire.FailureMessage,
+	index int) *ForwardingError {
+
+	return &ForwardingError{
+		FailureSourceIdx: index,
+		msg:              failure,
+	}
+}
+
+// NewUnknownForwardingError returns a forwarding error which has a nil failure
+// message. This constructor should only be used in the case where we cannot
+// decode the failure we have received from a peer.
+func NewUnknownForwardingError(index int) *ForwardingError {
+	return &ForwardingError{
+		FailureSourceIdx: index,
+	}
 }
 
 // ErrorDecrypter is an interface that is used to decrypt the onion encrypted
@@ -45,66 +143,30 @@ type ErrorDecrypter interface {
 	DecryptError(lnwire.OpaqueReason) (*ForwardingError, error)
 }
 
-// ErrorEncrypter is an interface that is used to encrypt HTLC related errors
-// at the source of the error, and also at each intermediate hop all the way
-// back to the source of the payment.
-type ErrorEncrypter interface {
-	// EncryptFirstHop transforms a concrete failure message into an
-	// encrypted opaque failure reason. This method will be used at the
-	// source that the error occurs. It differs from IntermediateEncrypt
-	// slightly, in that it computes a proper MAC over the error.
-	EncryptFirstHop(lnwire.FailureMessage) (lnwire.OpaqueReason, error)
+// UnknownEncrypterType is an error message used to signal that an unexpected
+// EncrypterType was encountered during decoding.
+type UnknownEncrypterType hop.EncrypterType
 
-	// IntermediateEncrypt wraps an already encrypted opaque reason error
-	// in an additional layer of onion encryption. This process repeats
-	// until the error arrives at the source of the payment.
-	IntermediateEncrypt(lnwire.OpaqueReason) lnwire.OpaqueReason
+// Error returns a formatted error indicating the invalid EncrypterType.
+func (e UnknownEncrypterType) Error() string {
+	return fmt.Sprintf("unknown error encrypter type: %d", e)
 }
 
-// SphinxErrorEncrypter is a concrete implementation of both the ErrorEncrypter
-// interface backed by an implementation of the Sphinx packet format. As a
-// result, all errors handled are themselves wrapped in layers of onion
-// encryption and must be treated as such accordingly.
-type SphinxErrorEncrypter struct {
-	*sphinx.OnionErrorEncrypter
+// OnionErrorDecrypter is the interface that provides onion level error
+// decryption.
+type OnionErrorDecrypter interface {
+	// DecryptError attempts to decrypt the passed encrypted error response.
+	// The onion failure is encrypted in backward manner, starting from the
+	// node where error have occurred. As a result, in order to decrypt the
+	// error we need get all shared secret and apply decryption in the
+	// reverse order.
+	DecryptError(encryptedData []byte) (*sphinx.DecryptedError, error)
 }
-
-// EncryptFirstHop transforms a concrete failure message into an encrypted
-// opaque failure reason. This method will be used at the source that the error
-// occurs. It differs from BackwardObfuscate slightly, in that it computes a
-// proper MAC over the error.
-//
-// NOTE: Part of the ErrorEncrypter interface.
-func (s *SphinxErrorEncrypter) EncryptFirstHop(failure lnwire.FailureMessage) (lnwire.OpaqueReason, error) {
-	var b bytes.Buffer
-	if err := lnwire.EncodeFailure(&b, failure, 0); err != nil {
-		return nil, err
-	}
-
-	// We pass a true as the first parameter to indicate that a MAC should
-	// be added.
-	return s.EncryptError(true, b.Bytes()), nil
-}
-
-// IntermediateEncrypt wraps an already encrypted opaque reason error in an
-// additional layer of onion encryption. This process repeats until the error
-// arrives at the source of the payment. We re-encrypt the message on the
-// backwards path to ensure that the error is indistinguishable from any other
-// error seen.
-//
-// NOTE: Part of the ErrorEncrypter interface.
-func (s *SphinxErrorEncrypter) IntermediateEncrypt(reason lnwire.OpaqueReason) lnwire.OpaqueReason {
-	return s.EncryptError(false, reason)
-}
-
-// A compile time check to ensure SphinxErrorEncrypter implements the
-// ErrorEncrypter interface.
-var _ ErrorEncrypter = (*SphinxErrorEncrypter)(nil)
 
 // SphinxErrorDecrypter wraps the sphinx data SphinxErrorDecrypter and maps the
 // returned errors to concrete lnwire.FailureMessage instances.
 type SphinxErrorDecrypter struct {
-	*sphinx.OnionErrorDecrypter
+	OnionErrorDecrypter
 }
 
 // DecryptError peels off each layer of onion encryption from the first hop, to
@@ -112,23 +174,23 @@ type SphinxErrorDecrypter struct {
 // along with the source of the error.
 //
 // NOTE: Part of the ErrorDecrypter interface.
-func (s *SphinxErrorDecrypter) DecryptError(reason lnwire.OpaqueReason) (*ForwardingError, error) {
+func (s *SphinxErrorDecrypter) DecryptError(reason lnwire.OpaqueReason) (
+	*ForwardingError, error) {
 
-	source, failureData, err := s.OnionErrorDecrypter.DecryptError(reason)
+	failure, err := s.OnionErrorDecrypter.DecryptError(reason)
 	if err != nil {
 		return nil, err
 	}
 
-	r := bytes.NewReader(failureData)
+	// Decode the failure. If an error occurs, we leave the failure message
+	// field nil.
+	r := bytes.NewReader(failure.Message)
 	failureMsg, err := lnwire.DecodeFailure(r, 0)
 	if err != nil {
-		return nil, err
+		return NewUnknownForwardingError(failure.SenderIdx), nil
 	}
 
-	return &ForwardingError{
-		ErrorSource:    source,
-		FailureMessage: failureMsg,
-	}, nil
+	return NewForwardingError(failureMsg, failure.SenderIdx), nil
 }
 
 // A compile time check to ensure ErrorDecrypter implements the Deobfuscator

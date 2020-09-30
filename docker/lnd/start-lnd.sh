@@ -4,7 +4,7 @@
 set -e
 
 # error function is used within a bash function in order to send the error
-# mesage directly to the stderr output and exit.
+# message directly to the stderr output and exit.
 error() {
     echo "$1" > /dev/stderr
     exit 0
@@ -49,9 +49,8 @@ if [[ "$CHAIN" == "litecoin" ]]; then
     BACKEND="ltcd"
 fi
 
-lnd \
-    --noencryptwallet \
-    --logdir="/data" \
+exec lnd \
+    --noseedbackup \
     "--$CHAIN.active" \
     "--$CHAIN.$NETWORK" \
     "--$CHAIN.node"="btcd" \

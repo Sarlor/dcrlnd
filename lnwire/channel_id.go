@@ -5,8 +5,8 @@ import (
 	"encoding/hex"
 	"math"
 
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/wire"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 )
 
 const (
@@ -22,7 +22,13 @@ const (
 // within the network. The ChannelID is computed using the outpoint of the
 // funding transaction (the txid, and output index). Given a funding output the
 // ChannelID can be calculated by XOR'ing the big-endian serialization of the
+// txid and the big-endian serialization of the output index, truncated to
+// 2 bytes.
 type ChannelID [32]byte
+
+// ConnectionWideID is an all-zero ChannelID, which is used to represent a
+// message intended for all channels to specific peer.
+var ConnectionWideID = ChannelID{}
 
 // String returns the string representation of the ChannelID. This is just the
 // hex string encoding of the ChannelID itself.
@@ -50,11 +56,11 @@ func NewChanIDFromOutPoint(op *wire.OutPoint) ChannelID {
 // ChannelID. To do this, we expect the cid parameter to contain the txid
 // unaltered and the outputIndex to be the output index
 func xorTxid(cid *ChannelID, outputIndex uint16) {
-	var buf [32]byte
-	binary.BigEndian.PutUint16(buf[30:], outputIndex)
+	var buf [2]byte
+	binary.BigEndian.PutUint16(buf[:], outputIndex)
 
-	cid[30] = cid[30] ^ buf[30]
-	cid[31] = cid[31] ^ buf[31]
+	cid[30] ^= buf[0]
+	cid[31] ^= buf[1]
 }
 
 // GenPossibleOutPoints generates all the possible outputs given a channel ID.
@@ -63,13 +69,13 @@ func xorTxid(cid *ChannelID, outputIndex uint16) {
 // mapping from channelID back to OutPoint.
 func (c *ChannelID) GenPossibleOutPoints() [MaxFundingTxOutputs]wire.OutPoint {
 	var possiblePoints [MaxFundingTxOutputs]wire.OutPoint
-	for i := uint32(0); i < MaxFundingTxOutputs; i++ {
+	for i := uint16(0); i < MaxFundingTxOutputs; i++ {
 		cidCopy := *c
-		xorTxid(&cidCopy, uint16(i))
+		xorTxid(&cidCopy, i)
 
 		possiblePoints[i] = wire.OutPoint{
 			Hash:  chainhash.Hash(cidCopy),
-			Index: i,
+			Index: uint32(i),
 		}
 	}
 

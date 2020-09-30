@@ -3,8 +3,7 @@ package lnwire
 import (
 	"io"
 
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcutil"
+	"github.com/btcsuite/btcutil"
 )
 
 // ClosingSigned is sent by both parties to a channel once the channel is clear
@@ -27,12 +26,12 @@ type ClosingSigned struct {
 	FeeSatoshis btcutil.Amount
 
 	// Signature is for the proposed channel close transaction.
-	Signature *btcec.Signature
+	Signature Sig
 }
 
 // NewClosingSigned creates a new empty ClosingSigned message.
 func NewClosingSigned(cid ChannelID, fs btcutil.Amount,
-	sig *btcec.Signature) *ClosingSigned {
+	sig Sig) *ClosingSigned {
 
 	return &ClosingSigned{
 		ChannelID:   cid,
@@ -50,7 +49,7 @@ var _ Message = (*ClosingSigned)(nil)
 //
 // This is part of the lnwire.Message interface.
 func (c *ClosingSigned) Decode(r io.Reader, pver uint32) error {
-	return readElements(r, &c.ChannelID, &c.FeeSatoshis, &c.Signature)
+	return ReadElements(r, &c.ChannelID, &c.FeeSatoshis, &c.Signature)
 }
 
 // Encode serializes the target ClosingSigned into the passed io.Writer
@@ -58,7 +57,7 @@ func (c *ClosingSigned) Decode(r io.Reader, pver uint32) error {
 //
 // This is part of the lnwire.Message interface.
 func (c *ClosingSigned) Encode(w io.Writer, pver uint32) error {
-	return writeElements(w, c.ChannelID, c.FeeSatoshis, c.Signature)
+	return WriteElements(w, c.ChannelID, c.FeeSatoshis, c.Signature)
 }
 
 // MsgType returns the integer uniquely identifying this message type on the

@@ -2,17 +2,18 @@ package routing
 
 import (
 	"fmt"
+	"image/color"
 	"net"
 	"sync"
 	"sync/atomic"
 
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
 )
 
 // TopologyClient represents an intent to receive notifications from the
@@ -56,6 +57,12 @@ type topologyClientUpdate struct {
 // nodes appearing, node updating their attributes, new channels, channels
 // closing, and updates in the routing policies of a channel's directed edges.
 func (r *ChannelRouter) SubscribeTopology() (*TopologyClient, error) {
+	// If the router is not yet started, return an error to avoid a
+	// deadlock waiting for it to handle the subscription request.
+	if atomic.LoadUint32(&r.started) == 0 {
+		return nil, fmt.Errorf("router not started")
+	}
+
 	// We'll first atomically obtain the next ID for this client from the
 	// incrementing client ID counter.
 	clientID := atomic.AddUint64(&r.ntfnClientCounter, 1)
@@ -111,18 +118,20 @@ type topologyClient struct {
 // graph topology in a non-blocking.
 func (r *ChannelRouter) notifyTopologyChange(topologyDiff *TopologyChange) {
 	r.RLock()
+	defer r.RUnlock()
+
 	numClients := len(r.topologyClients)
-	r.RUnlock()
-	if numClients != 0 {
-		log.Tracef("Sending topology notification to %v clients %v",
-			numClients,
-			newLogClosure(func() string {
-				return spew.Sdump(topologyDiff)
-			}),
-		)
+	if numClients == 0 {
+		return
 	}
 
-	r.RLock()
+	log.Tracef("Sending topology notification to %v clients %v",
+		numClients,
+		newLogClosure(func() string {
+			return spew.Sdump(topologyDiff)
+		}),
+	)
+
 	for _, client := range r.topologyClients {
 		client.wg.Add(1)
 
@@ -135,7 +144,7 @@ func (r *ChannelRouter) notifyTopologyChange(topologyDiff *TopologyChange) {
 			// directly to the upstream client consumer.
 			case c.ntfnChan <- topologyDiff:
 
-			// If the client cancel's the notifications, then we'll
+			// If the client cancels the notifications, then we'll
 			// exit early.
 			case <-c.exit:
 
@@ -146,7 +155,6 @@ func (r *ChannelRouter) notifyTopologyChange(topologyDiff *TopologyChange) {
 			}
 		}(client)
 	}
-	r.RUnlock()
 }
 
 // TopologyChange represents a new set of modifications to the channel graph.
@@ -219,7 +227,7 @@ func createCloseSummaries(blockHeight uint32,
 
 // NetworkNodeUpdate is an update for a  node within the Lightning Network. A
 // NetworkNodeUpdate is sent out either when a new node joins the network, or a
-// node broadcasts a new update with a newer time stamp that supersedes it's
+// node broadcasts a new update with a newer time stamp that supersedes its
 // old update. All updates are properly authenticated.
 type NetworkNodeUpdate struct {
 	// Addresses is a slice of all the node's known addresses.
@@ -236,6 +244,9 @@ type NetworkNodeUpdate struct {
 
 	// Alias is the alias or nick name of the node.
 	Alias string
+
+	// Color is the node's color in hex code format.
+	Color string
 }
 
 // ChannelEdgeUpdate is an update for a new channel within the ChannelGraph.
@@ -262,6 +273,9 @@ type ChannelEdgeUpdate struct {
 	// MinHTLC is the minimum HTLC amount that this channel will forward.
 	MinHTLC lnwire.MilliSatoshi
 
+	// MaxHTLC is the maximum HTLC amount that this channel will forward.
+	MaxHTLC lnwire.MilliSatoshi
+
 	// BaseFee is the base fee that will charged for all HTLC's forwarded
 	// across the this channel direction.
 	BaseFee lnwire.MilliSatoshi
@@ -281,6 +295,10 @@ type ChannelEdgeUpdate struct {
 
 	// ConnectingNode is the node that the advertising node connects to.
 	ConnectingNode *btcec.PublicKey
+
+	// Disabled, if true, signals that the channel is unavailable to relay
+	// payments.
+	Disabled bool
 }
 
 // appendTopologyChange appends the passed update message to the passed
@@ -296,10 +314,15 @@ func addToTopologyChange(graph *channeldb.ChannelGraph, update *TopologyChange,
 	// Any node announcement maps directly to a NetworkNodeUpdate struct.
 	// No further data munging or db queries are required.
 	case *channeldb.LightningNode:
+		pubKey, err := m.PubKey()
+		if err != nil {
+			return err
+		}
 		nodeUpdate := &NetworkNodeUpdate{
 			Addresses:   m.Addresses,
-			IdentityKey: m.PubKey,
+			IdentityKey: pubKey,
 			Alias:       m.Alias,
+			Color:       EncodeHexColor(m.Color),
 		}
 		nodeUpdate.IdentityKey.Curve = nil
 
@@ -327,9 +350,18 @@ func addToTopologyChange(graph *channeldb.ChannelGraph, update *TopologyChange,
 		// the second node.
 		sourceNode := edgeInfo.NodeKey1
 		connectingNode := edgeInfo.NodeKey2
-		if m.Flags&lnwire.ChanUpdateDirection == 1 {
+		if m.ChannelFlags&lnwire.ChanUpdateDirection == 1 {
 			sourceNode = edgeInfo.NodeKey2
 			connectingNode = edgeInfo.NodeKey1
+		}
+
+		aNode, err := sourceNode()
+		if err != nil {
+			return err
+		}
+		cNode, err := connectingNode()
+		if err != nil {
+			return err
 		}
 
 		edgeUpdate := &ChannelEdgeUpdate{
@@ -338,10 +370,12 @@ func addToTopologyChange(graph *channeldb.ChannelGraph, update *TopologyChange,
 			TimeLockDelta:   m.TimeLockDelta,
 			Capacity:        edgeInfo.Capacity,
 			MinHTLC:         m.MinHTLC,
+			MaxHTLC:         m.MaxHTLC,
 			BaseFee:         m.FeeBaseMSat,
 			FeeRate:         m.FeeProportionalMillionths,
-			AdvertisingNode: sourceNode,
-			ConnectingNode:  connectingNode,
+			AdvertisingNode: aNode,
+			ConnectingNode:  cNode,
+			Disabled:        m.ChannelFlags&lnwire.ChanUpdateDisabled != 0,
 		}
 		edgeUpdate.AdvertisingNode.Curve = nil
 		edgeUpdate.ConnectingNode.Curve = nil
@@ -352,7 +386,12 @@ func addToTopologyChange(graph *channeldb.ChannelGraph, update *TopologyChange,
 		return nil
 
 	default:
-		return fmt.Errorf("Unable to add to topology change, "+
+		return fmt.Errorf("unable to add to topology change, "+
 			"unknown message type %T", msg)
 	}
+}
+
+// EncodeHexColor takes a color and returns it in hex code format.
+func EncodeHexColor(color color.RGBA) string {
+	return fmt.Sprintf("#%02x%02x%02x", color.R, color.G, color.B)
 }

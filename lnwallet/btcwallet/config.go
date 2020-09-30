@@ -2,41 +2,27 @@ package btcwallet
 
 import (
 	"path/filepath"
+	"time"
 
-	"github.com/lightningnetwork/lnd/lnwallet"
-	"github.com/roasbeef/btcd/chaincfg"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/wire"
 
-	"github.com/roasbeef/btcwallet/chain"
+	"github.com/btcsuite/btcwallet/chain"
+	"github.com/btcsuite/btcwallet/wallet"
 
 	// This is required to register bdb as a valid walletdb driver. In the
 	// init function of the package, it registers itself. The import is used
 	// to activate the side effects w/o actually binding the package name to
 	// a file-level variable.
-	_ "github.com/roasbeef/btcwallet/walletdb/bdb"
+	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
 )
 
 var (
-	lnwalletHomeDir = btcutil.AppDataDir("lnwallet", false)
-	defaultDataDir  = lnwalletHomeDir
-
-	defaultLogFilename = "lnwallet.log"
-	defaultLogDirname  = "logs"
-	defaultLogDir      = filepath.Join(lnwalletHomeDir, defaultLogDirname)
-
-	btcdHomeDir        = btcutil.AppDataDir("btcd", false)
-	btcdHomedirCAFile  = filepath.Join(btcdHomeDir, "rpc.cert")
-	defaultRPCKeyFile  = filepath.Join(lnwalletHomeDir, "rpc.key")
-	defaultRPCCertFile = filepath.Join(lnwalletHomeDir, "rpc.cert")
-
 	// defaultPubPassphrase is the default public wallet passphrase which is
 	// used when the user indicates they do not want additional protection
 	// provided by having all public data in the wallet encrypted by a
 	// passphrase only known to them.
 	defaultPubPassphrase = []byte("public")
-
-	walletDbName = "lnwallet.db"
 )
 
 // Config is a struct which houses configuration parameters which modify the
@@ -63,18 +49,37 @@ type Config struct {
 	// unspecified, a new seed will be generated.
 	HdSeed []byte
 
+	// Birthday specifies the time at which this wallet was initially
+	// created. It is used to bound rescans for used addresses.
+	Birthday time.Time
+
+	// RecoveryWindow specifies the address look-ahead for which to scan
+	// when restoring a wallet. The recovery window will apply to all
+	// default BIP44 derivation paths.
+	RecoveryWindow uint32
+
 	// ChainSource is the primary chain interface. This is used to operate
 	// the wallet and do things such as rescanning, sending transactions,
 	// notifications for received funds, etc.
 	ChainSource chain.Interface
 
-	// FeeEstimator is an instance of the fee estimator interface which
-	// will be used by the wallet to dynamically set transaction fees when
-	// crafting transactions.
-	FeeEstimator lnwallet.FeeEstimator
-
 	// NetParams is the net parameters for the target chain.
 	NetParams *chaincfg.Params
+
+	// CoinType specifies the BIP 44 coin type to be used for derivation.
+	CoinType uint32
+
+	// Wallet is an unlocked wallet instance that is set if the
+	// UnlockerService has already opened and unlocked the wallet. If this
+	// is nil, then a wallet might have just been created or is simply not
+	// encrypted at all, in which case it should be attempted to be loaded
+	// normally when creating the BtcWallet.
+	Wallet *wallet.Wallet
+
+	// NoFreelistSync, if true, prevents the database from syncing its
+	// freelist to disk, resulting in improved performance at the expense of
+	// increased startup time.
+	NoFreelistSync bool
 }
 
 // NetworkDir returns the directory name of a network directory to hold wallet

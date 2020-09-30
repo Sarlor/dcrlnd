@@ -35,7 +35,7 @@ var _ Message = (*UpdateFailMalformedHTLC)(nil)
 //
 // This is part of the lnwire.Message interface.
 func (c *UpdateFailMalformedHTLC) Decode(r io.Reader, pver uint32) error {
-	return readElements(r,
+	return ReadElements(r,
 		&c.ChanID,
 		&c.ID,
 		c.ShaOnionBlob[:],
@@ -48,7 +48,7 @@ func (c *UpdateFailMalformedHTLC) Decode(r io.Reader, pver uint32) error {
 //
 // This is part of the lnwire.Message interface.
 func (c *UpdateFailMalformedHTLC) Encode(w io.Writer, pver uint32) error {
-	return writeElements(w,
+	return WriteElements(w,
 		c.ChanID,
 		c.ID,
 		c.ShaOnionBlob[:],
@@ -72,4 +72,12 @@ func (c *UpdateFailMalformedHTLC) MsgType() MessageType {
 func (c *UpdateFailMalformedHTLC) MaxPayloadLength(uint32) uint32 {
 	// 32 +  8 + 32 + 2
 	return 74
+}
+
+// TargetChanID returns the channel id of the link for which this message is
+// intended.
+//
+// NOTE: Part of peer.LinkUpdater interface.
+func (c *UpdateFailMalformedHTLC) TargetChanID() ChannelID {
+	return c.ChanID
 }

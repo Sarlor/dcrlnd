@@ -1,48 +1,14 @@
 // +build !rpctest
 
-package main
+package lnd
 
 import (
-	"io/ioutil"
-	"os"
 	"reflect"
 	"testing"
 
-	"github.com/btcsuite/btclog"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/roasbeef/btcd/wire"
 )
-
-func init() {
-	// Disable logging to prevent panics bc. of global state
-	channeldb.UseLogger(btclog.Disabled)
-	utxnLog = btclog.Disabled
-}
-
-// makeTestDB creates a new instance of the ChannelDB for testing purposes. A
-// callback which cleans up the created temporary directories is also returned
-// and intended to be executed after the test completes.
-func makeTestDB() (*channeldb.DB, func(), error) {
-	// First, create a temporary directory to be used for the duration of
-	// this test.
-	tempDirName, err := ioutil.TempDir("", "channeldb")
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Next, create channeldb for the first time.
-	cdb, err := channeldb.Open(tempDirName)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	cleanUp := func() {
-		cdb.Close()
-		os.RemoveAll(tempDirName)
-	}
-
-	return cdb, cleanUp, nil
-}
 
 type incubateTest struct {
 	nOutputs    int
@@ -82,21 +48,19 @@ func initIncubateTests() {
 // TestNurseryStoreInit verifies basic properties of the nursery store before
 // any modifying calls are made.
 func TestNurseryStoreInit(t *testing.T) {
-	cdb, cleanUp, err := makeTestDB()
+	cdb, cleanUp, err := channeldb.MakeTestDB()
 	if err != nil {
 		t.Fatalf("unable to open channel db: %v", err)
 	}
 	defer cleanUp()
 
-	ns, err := newNurseryStore(&bitcoinGenesis, cdb)
+	ns, err := newNurseryStore(&bitcoinTestnetGenesis, cdb)
 	if err != nil {
 		t.Fatalf("unable to open nursery store: %v", err)
 	}
 
 	assertNumChannels(t, ns, 0)
 	assertNumPreschools(t, ns, 0)
-	assertLastFinalizedHeight(t, ns, 0)
-	assertLastGraduatedHeight(t, ns, 0)
 }
 
 // TestNurseryStoreIncubate tests the primary state transitions taken by outputs
@@ -104,13 +68,13 @@ func TestNurseryStoreInit(t *testing.T) {
 // outputs through the nursery store, verifying the properties of the
 // intermediate states.
 func TestNurseryStoreIncubate(t *testing.T) {
-	cdb, cleanUp, err := makeTestDB()
+	cdb, cleanUp, err := channeldb.MakeTestDB()
 	if err != nil {
 		t.Fatalf("unable to open channel db: %v", err)
 	}
 	defer cleanUp()
 
-	ns, err := newNurseryStore(&bitcoinGenesis, cdb)
+	ns, err := newNurseryStore(&bitcoinTestnetGenesis, cdb)
 	if err != nil {
 		t.Fatalf("unable to open nursery store: %v", err)
 	}
@@ -127,7 +91,11 @@ func TestNurseryStoreIncubate(t *testing.T) {
 
 		// Begin incubating all of the outputs provided in this test
 		// vector.
-		err = ns.Incubate(test.commOutput, test.htlcOutputs)
+		var kids []kidOutput
+		if test.commOutput != nil {
+			kids = append(kids, *test.commOutput)
+		}
+		err = ns.Incubate(kids, test.htlcOutputs)
 		if err != nil {
 			t.Fatalf("unable to incubate outputs"+
 				"on test #%d: %v", i, err)
@@ -175,7 +143,7 @@ func TestNurseryStoreIncubate(t *testing.T) {
 
 			// Now, move the commitment output to the kindergarten
 			// bucket.
-			err = ns.PreschoolToKinder(test.commOutput)
+			err = ns.PreschoolToKinder(test.commOutput, 0)
 			if err != test.err {
 				t.Fatalf("unable to move commitment output from "+
 					"pscl to kndr: %v", err)
@@ -183,7 +151,7 @@ func TestNurseryStoreIncubate(t *testing.T) {
 
 			// The total number of outputs for this channel should
 			// not have changed, and the kindergarten output should
-			// reside at it's maturity height.
+			// reside at its maturity height.
 			assertNumChanOutputs(t, ns, test.chanPoint, test.nOutputs)
 			assertKndrAtMaturityHeight(t, ns, test.commOutput)
 
@@ -215,7 +183,7 @@ func TestNurseryStoreIncubate(t *testing.T) {
 			maturityHeight := test.commOutput.ConfHeight() +
 				test.commOutput.BlocksToMaturity()
 
-			err = ns.GraduateKinder(maturityHeight)
+			err = ns.GraduateKinder(maturityHeight, test.commOutput)
 			if err != nil {
 				t.Fatalf("unable to graduate kindergarten class at "+
 					"height %d: %v", maturityHeight, err)
@@ -223,7 +191,7 @@ func TestNurseryStoreIncubate(t *testing.T) {
 
 			// The total number of outputs for this channel should
 			// not have changed, but the kindergarten output should
-			// have been removed from it's maturity height.
+			// have been removed from its maturity height.
 			assertNumChanOutputs(t, ns, test.chanPoint, test.nOutputs)
 			assertKndrNotAtMaturityHeight(t, ns, test.commOutput)
 
@@ -254,7 +222,7 @@ func TestNurseryStoreIncubate(t *testing.T) {
 					test.nOutputs)
 
 				// If the output hasn't moved to kndr, it should
-				// be at it's crib expiry height, otherwise is
+				// be at its crib expiry height, otherwise is
 				// should have been removed.
 				for j := range test.htlcOutputs {
 					if j > i {
@@ -289,7 +257,8 @@ func TestNurseryStoreIncubate(t *testing.T) {
 				maturityHeight := htlcOutput.ConfHeight() +
 					htlcOutput.BlocksToMaturity()
 
-				err = ns.GraduateKinder(maturityHeight)
+				err = ns.GraduateKinder(maturityHeight,
+					&htlcOutput.kidOutput)
 				if err != nil {
 					t.Fatalf("unable to graduate htlc output "+
 						"from kndr to grad: %v", err)
@@ -336,104 +305,17 @@ func TestNurseryStoreIncubate(t *testing.T) {
 	}
 }
 
-// TestNurseryStoreFinalize tests that kindergarten sweep transactions are
-// properly persistted, and that the last finalized height is being set
-// accordingly.
-func TestNurseryStoreFinalize(t *testing.T) {
-	cdb, cleanUp, err := makeTestDB()
-	if err != nil {
-		t.Fatalf("unable to open channel db: %v", err)
-	}
-	defer cleanUp()
-
-	ns, err := newNurseryStore(&bitcoinGenesis, cdb)
-	if err != nil {
-		t.Fatalf("unable to open nursery store: %v", err)
-	}
-
-	kid := &kidOutputs[3]
-
-	// Compute the maturity height at which to enter the commitment output.
-	maturityHeight := kid.ConfHeight() + kid.BlocksToMaturity()
-
-	// Since we haven't finalized before, we should see a last finalized
-	// height of 0.
-	assertLastFinalizedHeight(t, ns, 0)
-
-	// Begin incubating the commitment output, which will be placed in the
-	// preschool bucket.
-	err = ns.Incubate(kid, nil)
-	if err != nil {
-		t.Fatalf("unable to incubate commitment output: %v", err)
-	}
-
-	// Then move the commitment output to the kindergarten bucket, so that
-	// the output is registered in the height index.
-	err = ns.PreschoolToKinder(kid)
-	if err != nil {
-		t.Fatalf("unable to move pscl output to kndr: %v", err)
-	}
-
-	// We should still see a last finalized height of 0, since no classes
-	// have been graduated.
-	assertLastFinalizedHeight(t, ns, 0)
-
-	// Now, iteratively finalize all heights below the maturity height,
-	// ensuring that the last finalized height is properly persisted, and
-	// that the finalized transactions are all nil.
-	for i := 0; i < int(maturityHeight); i++ {
-		err = ns.FinalizeKinder(uint32(i), nil)
-		if err != nil {
-			t.Fatalf("unable to finalize kndr at height=%d: %v",
-				i, err)
-		}
-		assertLastFinalizedHeight(t, ns, uint32(i))
-		assertFinalizedTxn(t, ns, uint32(i), nil)
-	}
-
-	// As we have now finalized all heights below the maturity height, we
-	// should still see the commitment output in the kindergarten bucket at
-	// its maturity height.
-	assertKndrAtMaturityHeight(t, ns, kid)
-
-	// Now, finalize the kindergarten sweep transaction at the maturity
-	// height.
-	err = ns.FinalizeKinder(maturityHeight, timeoutTx)
-	if err != nil {
-		t.Fatalf("unable to finalize kndr at height=%d: %v",
-			maturityHeight, err)
-	}
-
-	// The nursery store should now see the maturity height finalized, and
-	// the finalized kindergarten sweep txn should be returned at this
-	// height.
-	assertLastFinalizedHeight(t, ns, maturityHeight)
-	assertFinalizedTxn(t, ns, maturityHeight, timeoutTx)
-
-	// Lastly, continue to finalize heights above the maturity height. Each
-	// should report having a nil finalized kindergarten sweep txn.
-	for i := maturityHeight + 1; i < maturityHeight+10; i++ {
-		err = ns.FinalizeKinder(uint32(i), nil)
-		if err != nil {
-			t.Fatalf("unable to finalize kndr at height=%d: %v",
-				i, err)
-		}
-		assertLastFinalizedHeight(t, ns, uint32(i))
-		assertFinalizedTxn(t, ns, uint32(i), nil)
-	}
-}
-
 // TestNurseryStoreGraduate verifies that the nursery store properly removes
 // populated entries from the height index as it is purged, and that the last
 // purged height is set appropriately.
 func TestNurseryStoreGraduate(t *testing.T) {
-	cdb, cleanUp, err := makeTestDB()
+	cdb, cleanUp, err := channeldb.MakeTestDB()
 	if err != nil {
 		t.Fatalf("unable to open channel db: %v", err)
 	}
 	defer cleanUp()
 
-	ns, err := newNurseryStore(&bitcoinGenesis, cdb)
+	ns, err := newNurseryStore(&bitcoinTestnetGenesis, cdb)
 	if err != nil {
 		t.Fatalf("unable to open nursery store: %v", err)
 	}
@@ -444,19 +326,16 @@ func TestNurseryStoreGraduate(t *testing.T) {
 	// height index.
 	maturityHeight := kid.ConfHeight() + kid.BlocksToMaturity()
 
-	// Since we have never purged, the last purged height should be 0.
-	assertLastGraduatedHeight(t, ns, 0)
-
 	// First, add a commitment output to the nursery store, which is
 	// initially inserted in the preschool bucket.
-	err = ns.Incubate(kid, nil)
+	err = ns.Incubate([]kidOutput{*kid}, nil)
 	if err != nil {
 		t.Fatalf("unable to incubate commitment output: %v", err)
 	}
 
 	// Then, move the commitment output to the kindergarten bucket, such
-	// that it resides in the height index at it's maturity height.
-	err = ns.PreschoolToKinder(kid)
+	// that it resides in the height index at its maturity height.
+	err = ns.PreschoolToKinder(kid, 0)
 	if err != nil {
 		t.Fatalf("unable to move pscl output to kndr: %v", err)
 	}
@@ -465,40 +344,14 @@ func TestNurseryStoreGraduate(t *testing.T) {
 	// checking that each class is now empty, and that the last purged
 	// height is set correctly.
 	for i := 0; i < int(maturityHeight); i++ {
-		err = ns.GraduateHeight(uint32(i))
-		if err != nil {
-			t.Fatalf("unable to purge height=%d: %v", i, err)
-		}
-
-		assertLastGraduatedHeight(t, ns, uint32(i))
 		assertHeightIsPurged(t, ns, uint32(i))
 	}
 
-	// Check that the commitment output currently exists at it's maturity
+	// Check that the commitment output currently exists at its maturity
 	// height.
 	assertKndrAtMaturityHeight(t, ns, kid)
 
-	// Finalize the kindergarten transaction, ensuring that it is a non-nil
-	// value.
-	err = ns.FinalizeKinder(maturityHeight, timeoutTx)
-	if err != nil {
-		t.Fatalf("unable to finalize kndr at height=%d: %v",
-			maturityHeight, err)
-	}
-
-	// Verify that the maturity height has now been finalized.
-	assertLastFinalizedHeight(t, ns, maturityHeight)
-	assertFinalizedTxn(t, ns, maturityHeight, timeoutTx)
-
-	// Finally, purge the non-empty maturity height, and check that returned
-	// class is empty.
-	err = ns.GraduateHeight(maturityHeight)
-	if err != nil {
-		t.Fatalf("unable to set graduated height=%d: %v", maturityHeight,
-			err)
-	}
-
-	err = ns.GraduateKinder(maturityHeight)
+	err = ns.GraduateKinder(maturityHeight, kid)
 	if err != nil {
 		t.Fatalf("unable to graduate kindergarten outputs at height=%d: "+
 			"%v", maturityHeight, err)
@@ -528,36 +381,6 @@ func assertNumChanOutputs(t *testing.T, ns NurseryStore,
 	if count != expectedNum {
 		t.Fatalf("nursery store should have %d outputs, found %d",
 			expectedNum, count)
-	}
-}
-
-// assertLastFinalizedHeight checks that the nursery stores last finalized
-// height matches the expected height.
-func assertLastFinalizedHeight(t *testing.T, ns NurseryStore,
-	expected uint32) {
-
-	lfh, err := ns.LastFinalizedHeight()
-	if err != nil {
-		t.Fatalf("unable to get last finalized height: %v", err)
-	}
-
-	if lfh != expected {
-		t.Fatalf("expected last finalized height to be %d, got %d",
-			expected, lfh)
-	}
-}
-
-// assertLastGraduatedHeight checks that the nursery stores last purged height
-// matches the expected height.
-func assertLastGraduatedHeight(t *testing.T, ns NurseryStore, expected uint32) {
-	lgh, err := ns.LastGraduatedHeight()
-	if err != nil {
-		t.Fatalf("unable to get last graduated height: %v", err)
-	}
-
-	if lgh != expected {
-		t.Fatalf("expected last graduated height to be %d, got %d",
-			expected, lgh)
 	}
 }
 
@@ -595,14 +418,10 @@ func assertNumChannels(t *testing.T, ns NurseryStore, expected int) {
 func assertHeightIsPurged(t *testing.T, ns NurseryStore,
 	height uint32) {
 
-	finalTx, kndrOutputs, cribOutputs, err := ns.FetchClass(height)
+	kndrOutputs, cribOutputs, err := ns.FetchClass(height)
 	if err != nil {
 		t.Fatalf("unable to retrieve class at height=%d: %v",
 			height, err)
-	}
-
-	if finalTx != nil {
-		t.Fatalf("height=%d not purged, final txn should be nil", height)
 	}
 
 	if kndrOutputs != nil {
@@ -620,7 +439,7 @@ func assertCribAtExpiryHeight(t *testing.T, ns NurseryStore,
 	htlcOutput *babyOutput) {
 
 	expiryHeight := htlcOutput.expiry
-	_, _, cribOutputs, err := ns.FetchClass(expiryHeight)
+	_, cribOutputs, err := ns.FetchClass(expiryHeight)
 	if err != nil {
 		t.Fatalf("unable to retrieve class at height=%d: %v",
 			expiryHeight, err)
@@ -642,7 +461,7 @@ func assertCribNotAtExpiryHeight(t *testing.T, ns NurseryStore,
 	htlcOutput *babyOutput) {
 
 	expiryHeight := htlcOutput.expiry
-	_, _, cribOutputs, err := ns.FetchClass(expiryHeight)
+	_, cribOutputs, err := ns.FetchClass(expiryHeight)
 	if err != nil {
 		t.Fatalf("unable to retrieve class at height %d: %v",
 			expiryHeight, err)
@@ -656,25 +475,6 @@ func assertCribNotAtExpiryHeight(t *testing.T, ns NurseryStore,
 	}
 }
 
-// assertFinalizedTxn loads the class at the given height and compares the
-// returned finalized txn to that in the class. It is safe to presented a nil
-// expected transaction.
-func assertFinalizedTxn(t *testing.T, ns NurseryStore, height uint32,
-	exFinalTx *wire.MsgTx) {
-
-	finalTx, _, _, err := ns.FetchClass(height)
-	if err != nil {
-		t.Fatalf("unable to fetch class at height=%d: %v", height,
-			err)
-	}
-
-	if !reflect.DeepEqual(finalTx, exFinalTx) {
-		t.Fatalf("expected finalized txn at height=%d "+
-			"to be %v, got %v", height, finalTx.TxHash(),
-			exFinalTx.TxHash())
-	}
-}
-
 // assertKndrAtMaturityHeight loads the class at the provided height and
 // verifies that the provided kid output is one of the kindergarten outputs
 // returned.
@@ -683,7 +483,7 @@ func assertKndrAtMaturityHeight(t *testing.T, ns NurseryStore,
 
 	maturityHeight := kndrOutput.ConfHeight() +
 		kndrOutput.BlocksToMaturity()
-	_, kndrOutputs, _, err := ns.FetchClass(maturityHeight)
+	kndrOutputs, _, err := ns.FetchClass(maturityHeight)
 	if err != nil {
 		t.Fatalf("unable to retrieve class at height %d: %v",
 			maturityHeight, err)
@@ -708,7 +508,7 @@ func assertKndrNotAtMaturityHeight(t *testing.T, ns NurseryStore,
 	maturityHeight := kndrOutput.ConfHeight() +
 		kndrOutput.BlocksToMaturity()
 
-	_, kndrOutputs, _, err := ns.FetchClass(maturityHeight)
+	kndrOutputs, _, err := ns.FetchClass(maturityHeight)
 	if err != nil {
 		t.Fatalf("unable to retrieve class at height %d: %v",
 			maturityHeight, err)

@@ -3,20 +3,19 @@ package channeldb
 import (
 	"bytes"
 	"net"
-	"reflect"
 	"testing"
 	"time"
 
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/wire"
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/wire"
 )
 
 func TestLinkNodeEncodeDecode(t *testing.T) {
 	t.Parallel()
 
-	cdb, cleanUp, err := makeTestDB()
+	cdb, cleanUp, err := MakeTestDB()
 	if err != nil {
-		t.Fatalf("uanble to make test database: %v", err)
+		t.Fatalf("unable to make test database: %v", err)
 	}
 	defer cleanUp()
 
@@ -67,14 +66,13 @@ func TestLinkNodeEncodeDecode(t *testing.T) {
 			t.Fatalf("last seen timestamps don't match: expected %v got %v",
 				originalNodes[i].LastSeen.Unix(), node.LastSeen.Unix())
 		}
-		if !reflect.DeepEqual(originalNodes[i].Addresses,
-			node.Addresses) {
+		if originalNodes[i].Addresses[0].String() != node.Addresses[0].String() {
 			t.Fatalf("addresses don't match: expected %v, got %v",
 				originalNodes[i].Addresses, node.Addresses)
 		}
 	}
 
-	// Next, we'll excercise the methods to append additionall IP
+	// Next, we'll exercise the methods to append additional IP
 	// addresses, and also to update the last seen time.
 	if err := node1.UpdateLastSeen(time.Now()); err != nil {
 		t.Fatalf("unable to update last seen: %v", err)
@@ -83,7 +81,7 @@ func TestLinkNodeEncodeDecode(t *testing.T) {
 		t.Fatalf("unable to update addr: %v", err)
 	}
 
-	// Fetch the same node from the databse according to its public key.
+	// Fetch the same node from the database according to its public key.
 	node1DB, err := cdb.FetchLinkNode(pub1)
 	if err != nil {
 		t.Fatalf("unable to find node: %v", err)
@@ -96,7 +94,7 @@ func TestLinkNodeEncodeDecode(t *testing.T) {
 			node1.LastSeen.Unix(), node1DB.LastSeen.Unix())
 	}
 	if len(node1DB.Addresses) != 2 {
-		t.Fatalf("wrong length for node1 addrsses: expected %v, got %v",
+		t.Fatalf("wrong length for node1 addresses: expected %v, got %v",
 			2, len(node1DB.Addresses))
 	}
 	if node1DB.Addresses[0].String() != addr1.String() {
@@ -106,5 +104,37 @@ func TestLinkNodeEncodeDecode(t *testing.T) {
 	if node1DB.Addresses[1].String() != addr2.String() {
 		t.Fatalf("wrong address for node: expected %v, got %v",
 			addr2.String(), node1DB.Addresses[1].String())
+	}
+}
+
+func TestDeleteLinkNode(t *testing.T) {
+	t.Parallel()
+
+	cdb, cleanUp, err := MakeTestDB()
+	if err != nil {
+		t.Fatalf("unable to make test database: %v", err)
+	}
+	defer cleanUp()
+
+	_, pubKey := btcec.PrivKeyFromBytes(btcec.S256(), key[:])
+	addr := &net.TCPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: 1337,
+	}
+	linkNode := cdb.NewLinkNode(wire.TestNet3, pubKey, addr)
+	if err := linkNode.Sync(); err != nil {
+		t.Fatalf("unable to write link node to db: %v", err)
+	}
+
+	if _, err := cdb.FetchLinkNode(pubKey); err != nil {
+		t.Fatalf("unable to find link node: %v", err)
+	}
+
+	if err := cdb.DeleteLinkNode(pubKey); err != nil {
+		t.Fatalf("unable to delete link node from db: %v", err)
+	}
+
+	if _, err := cdb.FetchLinkNode(pubKey); err == nil {
+		t.Fatal("should not have found link node in db, but did")
 	}
 }

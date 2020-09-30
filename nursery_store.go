@@ -1,14 +1,14 @@
-package main
+package lnd
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
 
-	"github.com/boltdb/bolt"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/wire"
+	"github.com/lightningnetwork/lnd/channeldb/kvdb"
 )
 
 //	              Overview of Nursery Store Storage Hierarchy
@@ -22,21 +22,6 @@ import (
 //   multichain setting.
 //
 //   utxn<chain-hash>/
-//   |
-//   |   LAST PURGED + FINALIZED HEIGHTS
-//   |
-//   |   Each nursery store tracks a "last graduated height", which records the
-//   |   most recent block height for which the nursery store has successfully
-//   |   graduated all outputs. It also tracks a "last finalized height", which
-//   |   records the last block height that the nursery attempted to graduate
-//   |   If a finalized height has kindergarten outputs, the sweep txn for these
-//   |   outputs will be stored in the height bucket. This ensure that the same
-//   |   txid will be used after restarts. Otherwise, the nursery will be unable
-//   |   to recover the txid of kindergarten sweep transaction it has already
-//   |   broadcast.
-//   |
-//   ├── last-finalized-height-key: <last-finalized-height>
-//   ├── last-graduated-height-key: <last-graduated-height>
 //   |
 //   |   CHANNEL INDEX
 //   |
@@ -72,10 +57,7 @@ import (
 //   |   relative file path:
 //   |     e.g. <chan-point-3>/<prefix><outpoint-2>/
 //   |   that can be queried in the channel index to retrieve the serialized
-//   |   output. If a height bucket is less than or equal to the current last
-//   |   finalized height and has a non-zero number of kindergarten outputs, a
-//   |   height bucket will also contain the finalized kindergarten sweep txn
-//   |   under the "finalized-kndr-txn" key.
+//   |   output.
 //   |
 //   └── height-index-key/
 //       ├── <height-1>/                             <- HEIGHT BUCKET
@@ -84,70 +66,59 @@ import (
 //       |   |    └── <state-prefix><outpoint-5>: ""
 //       |   ├── <chan-point-2>/
 //       |   |    └── <state-prefix><outpoint-3>: ""
-//       |   └── finalized-kndr-txn:              "" | <kndr-sweep-tnx>
 //       └── <height-2>/
 //           └── <chan-point-1>/
 //                └── <state-prefix><outpoint-1>: ""
 //                └── <state-prefix><outpoint-2>: ""
+
+// TODO(joostjager): Add database migration to clean up now unused last
+// graduated height and finalized txes. This also prevents people downgrading
+// and surprising the downgraded nursery with missing data.
 
 // NurseryStore abstracts the persistent storage layer for the utxo nursery.
 // Concretely, it stores commitment and htlc outputs until any time-bounded
 // constraints have fully matured. The store exposes methods for enumerating its
 // contents, and persisting state transitions detected by the utxo nursery.
 type NurseryStore interface {
-
-	// Incubate registers a commitment output and a slice of htlc outputs to
-	// be swept back into the user's wallet. The event is persisted to disk,
-	// such that the nursery can resume the incubation process after a
-	// potential crash.
-	Incubate(*kidOutput, []babyOutput) error
+	// Incubate registers a set of CSV delayed outputs (incoming HTLC's on
+	// our commitment transaction, or a commitment output), and a slice of
+	// outgoing htlc outputs to be swept back into the user's wallet. The
+	// event is persisted to disk, such that the nursery can resume the
+	// incubation process after a potential crash.
+	Incubate([]kidOutput, []babyOutput) error
 
 	// CribToKinder atomically moves a babyOutput in the crib bucket to the
-	// kindergarten bucket. The now mature kidOutput contained in the
-	// babyOutput will be stored as it waits out the kidOutput's CSV delay.
+	// kindergarten bucket. Baby outputs are outgoing HTLC's which require
+	// us to go to the second-layer to claim. The now mature kidOutput
+	// contained in the babyOutput will be stored as it waits out the
+	// kidOutput's CSV delay.
 	CribToKinder(*babyOutput) error
 
 	// PreschoolToKinder atomically moves a kidOutput from the preschool
 	// bucket to the kindergarten bucket. This transition should be executed
-	// after receiving confirmation of the preschool output's commitment
-	// transaction.
-	PreschoolToKinder(*kidOutput) error
+	// after receiving confirmation of the preschool output. Incoming HTLC's
+	// we need to go to the second-layer to claim, and also our commitment
+	// outputs fall into this class.
+	//
+	// An additional parameter specifies the last graduated height. This is
+	// used in case of late registration. It schedules the output for sweep
+	// at the next epoch even though it has already expired earlier.
+	PreschoolToKinder(kid *kidOutput, lastGradHeight uint32) error
 
-	// GraduateKinder atomically moves the kindergarten class at the
-	// provided height into the graduated status. This involves removing the
-	// kindergarten entries from both the height and channel indexes, and
-	// cleaning up the finalized kindergarten sweep txn. The height bucket
-	// will be opportunistically pruned from the height index as outputs are
+	// GraduateKinder atomically moves an output at the provided height into
+	// the graduated status. This involves removing the kindergarten entries
+	// from both the height and channel indexes. The height bucket will be
+	// opportunistically pruned from the height index as outputs are
 	// removed.
-	GraduateKinder(height uint32) error
+	GraduateKinder(height uint32, output *kidOutput) error
 
-	// FetchPreschools returns a list of all outputs currently stored in the
-	// preschool bucket.
+	// FetchPreschools returns a list of all outputs currently stored in
+	// the preschool bucket.
 	FetchPreschools() ([]kidOutput, error)
 
 	// FetchClass returns a list of kindergarten and crib outputs whose
-	// timelocks expire at the given height. If the kindergarten class at
-	// this height hash been finalized previously, via FinalizeKinder, it
-	// will also returns the finalized kindergarten sweep txn.
-	FetchClass(height uint32) (*wire.MsgTx, []kidOutput, []babyOutput, error)
-
-	// FinalizeKinder accepts a block height and the kindergarten sweep txn
-	// computed for this height. Upon startup, we will rebroadcast any
-	// finalized kindergarten txns instead of signing a new txn, as this
-	// result in a different txid from a preceding broadcast.
-	FinalizeKinder(height uint32, tx *wire.MsgTx) error
-
-	// LastFinalizedHeight returns the last block height for which the
-	// nursery store finalized a kindergarten class.
-	LastFinalizedHeight() (uint32, error)
-
-	// GraduateHeight records the provided height as the last height for
-	// which the nursery store successfully graduated all outputs.
-	GraduateHeight(height uint32) error
-
-	// LastGraduatedHeight returns the last block height for which the
-	// nursery store successfully graduated all outputs.
-	LastGraduatedHeight() (uint32, error)
+	// timelocks expire at the given height.
+	FetchClass(height uint32) ([]kidOutput, []babyOutput, error)
 
 	// HeightsBelowOrEqual returns the lowest non-empty heights in the
 	// height index, that exist at or below the provided upper bound.
@@ -178,14 +149,6 @@ var (
 	// the root-level, chain-segmented bucket for each nursery store.
 	utxnChainPrefix = []byte("utxn")
 
-	// lastFinalizedHeightKey is a static key used to locate nursery store's
-	// last finalized height.
-	lastFinalizedHeightKey = []byte("last-finalized-height")
-
-	// lastGraduatedHeightKey is a static key used to retrieve the height of
-	// the last bucket that successfully graduated all outputs.
-	lastGraduatedHeightKey = []byte("last-graduated-height")
-
 	// channelIndexKey is a static key used to lookup the bucket containing
 	// all of the nursery's active channels.
 	channelIndexKey = []byte("channel-index")
@@ -194,10 +157,6 @@ var (
 	// containing all heights for which the nursery will need to take
 	// action.
 	heightIndexKey = []byte("height-index")
-
-	// finalizedKndrTxnKey is a static key that can be used to locate a
-	// finalized kindergarten sweep txn.
-	finalizedKndrTxnKey = []byte("finalized-kndr-txn")
 )
 
 // Defines the state prefixes that will be used to persistently track an
@@ -218,7 +177,7 @@ var (
 	// kndrPrefix is the state prefix given to all CSV delayed outputs,
 	// either from the commitment transaction, or a stage-one htlc
 	// transaction, whose maturity height has solidified. Outputs marked in
-	// this state are in their final stage of incubation withn the nursery,
+	// this state are in their final stage of incubation within the nursery,
 	// and will be swept into the wallet after waiting out the relative
 	// timelock.
 	kndrPrefix = []byte("kndr")
@@ -300,18 +259,23 @@ func newNurseryStore(chainHash *chainhash.Hash,
 	}, nil
 }
 
-// Incubate persists the beginning of the incubation process for the CSV-delayed
-// commitment output and a list of two-stage htlc outputs.
-func (ns *nurseryStore) Incubate(kid *kidOutput, babies []babyOutput) error {
-	return ns.db.Update(func(tx *bolt.Tx) error {
-		// Store commitment output in preschool bucket if not nil.
-		if kid != nil {
-			if err := ns.enterPreschool(tx, kid); err != nil {
+// Incubate persists the beginning of the incubation process for the
+// CSV-delayed outputs (commitment and incoming HTLC's), commitment output and
+// a list of outgoing two-stage htlc outputs.
+func (ns *nurseryStore) Incubate(kids []kidOutput, babies []babyOutput) error {
+	return kvdb.Update(ns.db, func(tx kvdb.RwTx) error {
+		// If we have any kid outputs to incubate, then we'll attempt
+		// to add each of them to the nursery store. Any duplicate
+		// outputs will be ignored.
+		for _, kid := range kids {
+			if err := ns.enterPreschool(tx, &kid); err != nil {
 				return err
 			}
 		}
 
-		// Add all htlc outputs to the crib bucket.
+		// Next, we'll Add all htlc outputs to the crib bucket.
+		// Similarly, we'll ignore any outputs that have already been
+		// inserted.
 		for _, baby := range babies {
 			if err := ns.enterCrib(tx, &baby); err != nil {
 				return err
@@ -326,7 +290,7 @@ func (ns *nurseryStore) Incubate(kid *kidOutput, babies []babyOutput) error {
 // kindergarten bucket. The now mature kidOutput contained in the babyOutput
 // will be stored as it waits out the kidOutput's CSV delay.
 func (ns *nurseryStore) CribToKinder(bby *babyOutput) error {
-	return ns.db.Update(func(tx *bolt.Tx) error {
+	return kvdb.Update(ns.db, func(tx kvdb.RwTx) error {
 
 		// First, retrieve or create the channel bucket corresponding to
 		// the baby output's origin channel point.
@@ -384,13 +348,17 @@ func (ns *nurseryStore) CribToKinder(bby *babyOutput) error {
 		// the block height at which the output was confirmed.
 		maturityHeight := bby.ConfHeight() + bby.BlocksToMaturity()
 
-		// Retrive or create a height-channel bucket corresponding to
+		// Retrieve or create a height-channel bucket corresponding to
 		// the kidOutput's maturity height.
 		hghtChanBucketCsv, err := ns.createHeightChanBucket(tx,
 			maturityHeight, chanPoint)
 		if err != nil {
 			return err
 		}
+
+		utxnLog.Tracef("Transitioning (crib -> baby) output for "+
+			"chan_point=%v at height_index=%v", chanPoint,
+			maturityHeight)
 
 		// Register the kindergarten output's prefixed output key in the
 		// height-channel bucket corresponding to its maturity height.
@@ -403,9 +371,10 @@ func (ns *nurseryStore) CribToKinder(bby *babyOutput) error {
 // PreschoolToKinder atomically moves a kidOutput from the preschool bucket to
 // the kindergarten bucket. This transition should be executed after receiving
 // confirmation of the preschool output's commitment transaction.
-func (ns *nurseryStore) PreschoolToKinder(kid *kidOutput) error {
-	return ns.db.Update(func(tx *bolt.Tx) error {
+func (ns *nurseryStore) PreschoolToKinder(kid *kidOutput,
+	lastGradHeight uint32) error {
 
+	return kvdb.Update(ns.db, func(tx kvdb.RwTx) error {
 		// Create or retrieve the channel bucket corresponding to the
 		// kid output's origin channel point.
 		chanPoint := kid.OriginChanPoint()
@@ -451,13 +420,34 @@ func (ns *nurseryStore) PreschoolToKinder(kid *kidOutput) error {
 			return err
 		}
 
-		// Since the CSV delay on the kid output has now begun ticking,
-		// we must insert a record of in the height index to remind us
-		// to revisit this output once it has fully matured.
+		// If this output has an absolute time lock, then we'll set the
+		// maturity height directly.
+		var maturityHeight uint32
+		if kid.BlocksToMaturity() == 0 {
+			maturityHeight = kid.absoluteMaturity
+		} else {
+			// Otherwise, since the CSV delay on the kid output has
+			// now begun ticking, we must insert a record of in the
+			// height index to remind us to revisit this output
+			// once it has fully matured.
+			//
+			// Compute the maturity height, by adding the output's
+			// CSV delay to its confirmation height.
+			maturityHeight = kid.ConfHeight() + kid.BlocksToMaturity()
+		}
 
-		// Compute the maturity height, by adding the output's CSV delay
-		// to its confirmation height.
-		maturityHeight := kid.ConfHeight() + kid.BlocksToMaturity()
+		if maturityHeight <= lastGradHeight {
+			utxnLog.Debugf("Late Registration for kid output=%v "+
+				"detected: class_height=%v, "+
+				"last_graduated_height=%v", kid.OutPoint(),
+				maturityHeight, lastGradHeight)
+
+			maturityHeight = lastGradHeight + 1
+		}
+
+		utxnLog.Infof("Transitioning (crib -> kid) output for "+
+			"chan_point=%v at height_index=%v", chanPoint,
+			maturityHeight)
 
 		// Create or retrieve the height-channel bucket for this
 		// channel. This method will first create a height bucket for
@@ -476,108 +466,65 @@ func (ns *nurseryStore) PreschoolToKinder(kid *kidOutput) error {
 	})
 }
 
-// GraduateKinder atomically moves the kindergarten class at the provided height
-// into the graduated status. This involves removing the kindergarten entries
-// from both the height and channel indexes, and cleaning up the finalized
-// kindergarten sweep txn. The height bucket will be opportunistically pruned
-// from the height index as outputs are removed.
-func (ns *nurseryStore) GraduateKinder(height uint32) error {
-	return ns.db.Update(func(tx *bolt.Tx) error {
+// GraduateKinder atomically moves an output at the provided height into the
+// graduated status. This involves removing the kindergarten entries from both
+// the height and channel indexes. The height bucket will be opportunistically
+// pruned from the height index as outputs are removed.
+func (ns *nurseryStore) GraduateKinder(height uint32, kid *kidOutput) error {
+	return kvdb.Update(ns.db, func(tx kvdb.RwTx) error {
 
-		// Since all kindergarten outputs at a particular height are
-		// swept in a single txn, we can now safely delete the finalized
-		// txn, since it has already been broadcast and confirmed.
 		hghtBucket := ns.getHeightBucket(tx, height)
 		if hghtBucket == nil {
 			// Nothing to delete, bucket has already been removed.
 			return nil
 		}
 
-		// Remove the finalized kindergarten txn, we do this before
-		// removing the outputs so that the extra entry doesn't prevent
-		// the height bucket from being opportunistically pruned below.
-		if err := hghtBucket.Delete(finalizedKndrTxnKey); err != nil {
+		// For the kindergarten output, delete its entry from the
+		// height and channel index, and create a new grad output in the
+		// channel index.
+		outpoint := kid.OutPoint()
+		chanPoint := kid.OriginChanPoint()
+
+		// Construct the key under which the output is
+		// currently stored height and channel indexes.
+		pfxOutputKey, err := prefixOutputKey(kndrPrefix,
+			outpoint)
+		if err != nil {
 			return err
 		}
 
-		// For each kindergarten found output, delete its entry from the
-		// height and channel index, and create a new grad output in the
-		// channel index.
-		return ns.forEachHeightPrefix(tx, kndrPrefix, height,
-			func(v []byte) error {
-				var kid kidOutput
-				err := kid.Decode(bytes.NewReader(v))
-				if err != nil {
-					return err
-				}
+		// Remove the grad output's entry in the height
+		// index.
+		err = ns.removeOutputFromHeight(tx, height,
+			chanPoint, pfxOutputKey)
+		if err != nil {
+			return err
+		}
 
-				outpoint := kid.OutPoint()
-				chanPoint := kid.OriginChanPoint()
+		chanBucket := ns.getChannelBucketWrite(tx, chanPoint)
+		if chanBucket == nil {
+			return ErrContractNotFound
+		}
 
-				// Construct the key under which the output is
-				// currently stored height and channel indexes.
-				pfxOutputKey, err := prefixOutputKey(kndrPrefix,
-					outpoint)
-				if err != nil {
-					return err
-				}
+		// Remove previous output with kindergarten
+		// prefix.
+		err = chanBucket.Delete(pfxOutputKey)
+		if err != nil {
+			return err
+		}
 
-				// Remove the grad output's entry in the height
-				// index.
-				err = ns.removeOutputFromHeight(tx, height,
-					chanPoint, pfxOutputKey)
-				if err != nil {
-					return err
-				}
+		// Convert kindergarten key to graduate key.
+		copy(pfxOutputKey, gradPrefix)
 
-				chanBucket := ns.getChannelBucket(tx,
-					chanPoint)
-				if chanBucket == nil {
-					return ErrContractNotFound
-				}
+		var gradBuffer bytes.Buffer
+		if err := kid.Encode(&gradBuffer); err != nil {
+			return err
+		}
 
-				// Remove previous output with kindergarten
-				// prefix.
-				err = chanBucket.Delete(pfxOutputKey)
-				if err != nil {
-					return err
-				}
-
-				// Convert kindergarten key to graduate key.
-				copy(pfxOutputKey, gradPrefix)
-
-				var gradBuffer bytes.Buffer
-				if err := kid.Encode(&gradBuffer); err != nil {
-					return err
-				}
-
-				// Insert serialized output into channel bucket
-				// using graduate-prefixed key.
-				return chanBucket.Put(pfxOutputKey,
-					gradBuffer.Bytes())
-			},
-		)
-	})
-}
-
-// FinalizeKinder accepts a block height and a finalized kindergarten sweep
-// transaction, persisting the transaction at the appropriate height bucket. The
-// nursery store's last finalized height is also updated with the provided
-// height.
-func (ns *nurseryStore) FinalizeKinder(height uint32,
-	finalTx *wire.MsgTx) error {
-
-	return ns.db.Update(func(tx *bolt.Tx) error {
-		return ns.finalizeKinder(tx, height, finalTx)
-	})
-}
-
-// GraduateHeight persists the provided height as the nursery store's last
-// graduated height.
-func (ns *nurseryStore) GraduateHeight(height uint32) error {
-
-	return ns.db.Update(func(tx *bolt.Tx) error {
-		return ns.putLastGraduatedHeight(tx, height)
+		// Insert serialized output into channel bucket
+		// using graduate-prefixed key.
+		return chanBucket.Put(pfxOutputKey,
+			gradBuffer.Bytes())
 	})
 }
 
@@ -586,23 +533,15 @@ func (ns *nurseryStore) GraduateHeight(height uint32) error {
 // FetchClass returns a list of the kindergarten and crib outputs whose timeouts
 // are expiring
 func (ns *nurseryStore) FetchClass(
-	height uint32) (*wire.MsgTx, []kidOutput, []babyOutput, error) {
+	height uint32) ([]kidOutput, []babyOutput, error) {
 
 	// Construct list of all crib and kindergarten outputs that need to be
 	// processed at the provided block height.
-	var finalTx *wire.MsgTx
 	var kids []kidOutput
 	var babies []babyOutput
-	if err := ns.db.View(func(tx *bolt.Tx) error {
-
-		var err error
-		finalTx, err = ns.getFinalizedTxn(tx, height)
-		if err != nil {
-			return err
-		}
-
+	if err := kvdb.View(ns.db, func(tx kvdb.RTx) error {
 		// Append each crib output to our list of babyOutputs.
-		if err = ns.forEachHeightPrefix(tx, cribPrefix, height,
+		if err := ns.forEachHeightPrefix(tx, cribPrefix, height,
 			func(buf []byte) error {
 
 				// We will attempt to deserialize all outputs
@@ -644,26 +583,26 @@ func (ns *nurseryStore) FetchClass(
 			})
 
 	}); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
-	return finalTx, kids, babies, nil
+	return kids, babies, nil
 }
 
 // FetchPreschools returns a list of all outputs currently stored in the
 // preschool bucket.
 func (ns *nurseryStore) FetchPreschools() ([]kidOutput, error) {
 	var kids []kidOutput
-	if err := ns.db.View(func(tx *bolt.Tx) error {
+	if err := kvdb.View(ns.db, func(tx kvdb.RTx) error {
 
 		// Retrieve the existing chain bucket for this nursery store.
-		chainBucket := tx.Bucket(ns.pfxChainKey)
+		chainBucket := tx.ReadBucket(ns.pfxChainKey)
 		if chainBucket == nil {
 			return nil
 		}
 
 		// Load the existing channel index from the chain bucket.
-		chanIndex := chainBucket.Bucket(channelIndexKey)
+		chanIndex := chainBucket.NestedReadBucket(channelIndexKey)
 		if chanIndex == nil {
 			return nil
 		}
@@ -686,7 +625,7 @@ func (ns *nurseryStore) FetchPreschools() ([]kidOutput, error) {
 		for _, chanBytes := range activeChannels {
 			// Retrieve the channel bucket associated with this
 			// channel.
-			chanBucket := chanIndex.Bucket(chanBytes)
+			chanBucket := chanIndex.NestedReadBucket(chanBytes)
 			if chanBucket == nil {
 				continue
 			}
@@ -695,7 +634,7 @@ func (ns *nurseryStore) FetchPreschools() ([]kidOutput, error) {
 			// "pscl" prefix. So, we will perform a prefix scan of
 			// the channel bucket to efficiently enumerate all the
 			// desired outputs.
-			c := chanBucket.Cursor()
+			c := chanBucket.ReadCursor()
 			for k, v := c.Seek(psclPrefix); bytes.HasPrefix(
 				k, psclPrefix); k, v = c.Next() {
 
@@ -727,16 +666,16 @@ func (ns *nurseryStore) FetchPreschools() ([]kidOutput, error) {
 // index at or below the provided upper bound.
 func (ns *nurseryStore) HeightsBelowOrEqual(height uint32) ([]uint32, error) {
 	var activeHeights []uint32
-	err := ns.db.View(func(tx *bolt.Tx) error {
+	err := kvdb.View(ns.db, func(tx kvdb.RTx) error {
 		// Ensure that the chain bucket for this nursery store exists.
-		chainBucket := tx.Bucket(ns.pfxChainKey)
+		chainBucket := tx.ReadBucket(ns.pfxChainKey)
 		if chainBucket == nil {
 			return nil
 		}
 
 		// Ensure that the height index has been properly initialized for this
 		// chain.
-		hghtIndex := chainBucket.Bucket(heightIndexKey)
+		hghtIndex := chainBucket.NestedReadBucket(heightIndexKey)
 		if hghtIndex == nil {
 			return nil
 		}
@@ -746,7 +685,7 @@ func (ns *nurseryStore) HeightsBelowOrEqual(height uint32) ([]uint32, error) {
 		var lower, upper [4]byte
 		byteOrder.PutUint32(upper[:], height)
 
-		c := hghtIndex.Cursor()
+		c := hghtIndex.ReadCursor()
 		for k, _ := c.Seek(lower[:]); bytes.Compare(k, upper[:]) <= 0 &&
 			len(k) == 4; k, _ = c.Next() {
 
@@ -772,7 +711,7 @@ func (ns *nurseryStore) HeightsBelowOrEqual(height uint32) ([]uint32, error) {
 func (ns *nurseryStore) ForChanOutputs(chanPoint *wire.OutPoint,
 	callback func([]byte, []byte) error) error {
 
-	return ns.db.View(func(tx *bolt.Tx) error {
+	return kvdb.View(ns.db, func(tx kvdb.RTx) error {
 		return ns.forChanOutputs(tx, chanPoint, callback)
 	})
 }
@@ -780,15 +719,15 @@ func (ns *nurseryStore) ForChanOutputs(chanPoint *wire.OutPoint,
 // ListChannels returns all channels the nursery is currently tracking.
 func (ns *nurseryStore) ListChannels() ([]wire.OutPoint, error) {
 	var activeChannels []wire.OutPoint
-	if err := ns.db.View(func(tx *bolt.Tx) error {
+	if err := kvdb.View(ns.db, func(tx kvdb.RTx) error {
 		// Retrieve the existing chain bucket for this nursery store.
-		chainBucket := tx.Bucket(ns.pfxChainKey)
+		chainBucket := tx.ReadBucket(ns.pfxChainKey)
 		if chainBucket == nil {
 			return nil
 		}
 
 		// Retrieve the existing channel index.
-		chanIndex := chainBucket.Bucket(channelIndexKey)
+		chanIndex := chainBucket.NestedReadBucket(channelIndexKey)
 		if chanIndex == nil {
 			return nil
 		}
@@ -814,7 +753,7 @@ func (ns *nurseryStore) ListChannels() ([]wire.OutPoint, error) {
 // IsMatureChannel determines the whether or not all of the outputs in a
 // particular channel bucket have been marked as graduated.
 func (ns *nurseryStore) IsMatureChannel(chanPoint *wire.OutPoint) (bool, error) {
-	err := ns.db.View(func(tx *bolt.Tx) error {
+	err := kvdb.View(ns.db, func(tx kvdb.RTx) error {
 		// Iterate over the contents of the channel bucket, computing
 		// both total number of outputs, and those that have the grad
 		// prefix.
@@ -843,15 +782,15 @@ var ErrImmatureChannel = errors.New("cannot remove immature channel, " +
 // provided channel point.
 // NOTE: The channel's entries in the height index are assumed to be removed.
 func (ns *nurseryStore) RemoveChannel(chanPoint *wire.OutPoint) error {
-	return ns.db.Update(func(tx *bolt.Tx) error {
+	return kvdb.Update(ns.db, func(tx kvdb.RwTx) error {
 		// Retrieve the existing chain bucket for this nursery store.
-		chainBucket := tx.Bucket(ns.pfxChainKey)
+		chainBucket := tx.ReadWriteBucket(ns.pfxChainKey)
 		if chainBucket == nil {
 			return nil
 		}
 
 		// Retrieve the channel index stored in the chain bucket.
-		chanIndex := chainBucket.Bucket(channelIndexKey)
+		chanIndex := chainBucket.NestedReadWriteBucket(channelIndexKey)
 		if chanIndex == nil {
 			return nil
 		}
@@ -884,7 +823,7 @@ func (ns *nurseryStore) RemoveChannel(chanPoint *wire.OutPoint) error {
 
 			maturityHeight := kid.ConfHeight() + kid.BlocksToMaturity()
 
-			hghtBucket := ns.getHeightBucket(tx, maturityHeight)
+			hghtBucket := ns.getHeightBucketWrite(tx, maturityHeight)
 			if hghtBucket == nil {
 				return nil
 			}
@@ -899,51 +838,17 @@ func (ns *nurseryStore) RemoveChannel(chanPoint *wire.OutPoint) error {
 	})
 }
 
-// LastFinalizedHeight returns the last block height for which the nursery
-// store has finalized a kindergarten class.
-func (ns *nurseryStore) LastFinalizedHeight() (uint32, error) {
-	var lastFinalizedHeight uint32
-	err := ns.db.View(func(tx *bolt.Tx) error {
-		var err error
-		lastFinalizedHeight, err = ns.getLastFinalizedHeight(tx)
-		return err
-	})
-
-	return lastFinalizedHeight, err
-}
-
-// LastGraduatedHeight returns the last block height for which the nursery
-// store has successfully graduated all outputs.
-func (ns *nurseryStore) LastGraduatedHeight() (uint32, error) {
-	var lastGraduatedHeight uint32
-	err := ns.db.View(func(tx *bolt.Tx) error {
-		var err error
-		lastGraduatedHeight, err = ns.getLastGraduatedHeight(tx)
-		return err
-	})
-
-	return lastGraduatedHeight, err
-}
-
 // Helper Methods
 
 // enterCrib accepts a new htlc output that the nursery will incubate through
 // its two-stage process of sweeping funds back to the user's wallet. These
 // outputs are persisted in the nursery store in the crib state, and will be
 // revisited after the first-stage output's CLTV has expired.
-func (ns *nurseryStore) enterCrib(tx *bolt.Tx, baby *babyOutput) error {
+func (ns *nurseryStore) enterCrib(tx kvdb.RwTx, baby *babyOutput) error {
 	// First, retrieve or create the channel bucket corresponding to the
 	// baby output's origin channel point.
 	chanPoint := baby.OriginChanPoint()
 	chanBucket, err := ns.createChannelBucket(tx, chanPoint)
-	if err != nil {
-		return err
-	}
-
-	// Next, retrieve or create the height-channel bucket located in the
-	// height bucket corresponding to the baby output's CLTV expiry height.
-	hghtChanBucket, err := ns.createHeightChanBucket(tx,
-		baby.expiry, chanPoint)
 	if err != nil {
 		return err
 	}
@@ -955,8 +860,24 @@ func (ns *nurseryStore) enterCrib(tx *bolt.Tx, baby *babyOutput) error {
 		return err
 	}
 
-	// Serialize the baby output so that it can be written to the underlying
-	// key-value store.
+	// We'll first check that we don't already have an entry for this
+	// output. If we do, then we can exit early.
+	if rawBytes := chanBucket.Get(pfxOutputKey); rawBytes != nil {
+		return nil
+	}
+
+	// Next, retrieve or create the height-channel bucket located in the
+	// height bucket corresponding to the baby output's CLTV expiry height.
+
+	// TODO: Handle late registration.
+	hghtChanBucket, err := ns.createHeightChanBucket(tx,
+		baby.expiry, chanPoint)
+	if err != nil {
+		return err
+	}
+
+	// Serialize the baby output so that it can be written to the
+	// underlying key-value store.
 	var babyBuffer bytes.Buffer
 	if err := baby.Encode(&babyBuffer); err != nil {
 		return err
@@ -970,9 +891,9 @@ func (ns *nurseryStore) enterCrib(tx *bolt.Tx, baby *babyOutput) error {
 	}
 
 	// Finally, create a corresponding bucket in the height-channel bucket
-	// for this crib output. The existence of this bucket indicates that the
-	// serialized output can be retrieved from the channel bucket using the
-	// same prefix key.
+	// for this crib output. The existence of this bucket indicates that
+	// the serialized output can be retrieved from the channel bucket using
+	// the same prefix key.
 	return hghtChanBucket.Put(pfxOutputKey, []byte{})
 }
 
@@ -980,7 +901,7 @@ func (ns *nurseryStore) enterCrib(tx *bolt.Tx, baby *babyOutput) error {
 // through a single stage before sweeping. Outputs are stored in the preschool
 // bucket until the commitment transaction has been confirmed, at which point
 // they will be moved to the kindergarten bucket.
-func (ns *nurseryStore) enterPreschool(tx *bolt.Tx, kid *kidOutput) error {
+func (ns *nurseryStore) enterPreschool(tx kvdb.RwTx, kid *kidOutput) error {
 	// First, retrieve or create the channel bucket corresponding to the
 	// baby output's origin channel point.
 	chanPoint := kid.OriginChanPoint()
@@ -996,6 +917,12 @@ func (ns *nurseryStore) enterPreschool(tx *bolt.Tx, kid *kidOutput) error {
 		return err
 	}
 
+	// We'll first check if an entry for this key is already stored. If so,
+	// then we'll ignore this request, and return a nil error.
+	if rawBytes := chanBucket.Get(pfxOutputKey); rawBytes != nil {
+		return nil
+	}
+
 	// Serialize the kidOutput and insert it into the channel bucket.
 	var kidBuffer bytes.Buffer
 	if err := kid.Encode(&kidBuffer); err != nil {
@@ -1007,11 +934,11 @@ func (ns *nurseryStore) enterPreschool(tx *bolt.Tx, kid *kidOutput) error {
 
 // createChannelBucket creates or retrieves a channel bucket for the provided
 // channel point.
-func (ns *nurseryStore) createChannelBucket(tx *bolt.Tx,
-	chanPoint *wire.OutPoint) (*bolt.Bucket, error) {
+func (ns *nurseryStore) createChannelBucket(tx kvdb.RwTx,
+	chanPoint *wire.OutPoint) (kvdb.RwBucket, error) {
 
 	// Ensure that the chain bucket for this nursery store exists.
-	chainBucket, err := tx.CreateBucketIfNotExists(ns.pfxChainKey)
+	chainBucket, err := tx.CreateTopLevelBucket(ns.pfxChainKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1038,17 +965,17 @@ func (ns *nurseryStore) createChannelBucket(tx *bolt.Tx,
 // getChannelBucket retrieves an existing channel bucket from the nursery store,
 // using the given channel point.  If the bucket does not exist, or any bucket
 // along its path does not exist, a nil value is returned.
-func (ns *nurseryStore) getChannelBucket(tx *bolt.Tx,
-	chanPoint *wire.OutPoint) *bolt.Bucket {
+func (ns *nurseryStore) getChannelBucket(tx kvdb.RTx,
+	chanPoint *wire.OutPoint) kvdb.RBucket {
 
 	// Retrieve the existing chain bucket for this nursery store.
-	chainBucket := tx.Bucket(ns.pfxChainKey)
+	chainBucket := tx.ReadBucket(ns.pfxChainKey)
 	if chainBucket == nil {
 		return nil
 	}
 
 	// Retrieve the existing channel index.
-	chanIndex := chainBucket.Bucket(channelIndexKey)
+	chanIndex := chainBucket.NestedReadBucket(channelIndexKey)
 	if chanIndex == nil {
 		return nil
 	}
@@ -1060,16 +987,44 @@ func (ns *nurseryStore) getChannelBucket(tx *bolt.Tx,
 		return nil
 	}
 
-	return chanIndex.Bucket(chanBuffer.Bytes())
+	return chanIndex.NestedReadBucket(chanBuffer.Bytes())
+}
+
+// getChannelBucketWrite retrieves an existing channel bucket from the nursery store,
+// using the given channel point.  If the bucket does not exist, or any bucket
+// along its path does not exist, a nil value is returned.
+func (ns *nurseryStore) getChannelBucketWrite(tx kvdb.RwTx,
+	chanPoint *wire.OutPoint) kvdb.RwBucket {
+
+	// Retrieve the existing chain bucket for this nursery store.
+	chainBucket := tx.ReadWriteBucket(ns.pfxChainKey)
+	if chainBucket == nil {
+		return nil
+	}
+
+	// Retrieve the existing channel index.
+	chanIndex := chainBucket.NestedReadWriteBucket(channelIndexKey)
+	if chanIndex == nil {
+		return nil
+	}
+
+	// Serialize the provided channel point and return the bucket matching
+	// the serialized key.
+	var chanBuffer bytes.Buffer
+	if err := writeOutpoint(&chanBuffer, chanPoint); err != nil {
+		return nil
+	}
+
+	return chanIndex.NestedReadWriteBucket(chanBuffer.Bytes())
 }
 
 // createHeightBucket creates or retrieves an existing bucket from the height
 // index, corresponding to the provided height.
-func (ns *nurseryStore) createHeightBucket(tx *bolt.Tx,
-	height uint32) (*bolt.Bucket, error) {
+func (ns *nurseryStore) createHeightBucket(tx kvdb.RwTx,
+	height uint32) (kvdb.RwBucket, error) {
 
 	// Ensure that the chain bucket for this nursery store exists.
-	chainBucket, err := tx.CreateBucketIfNotExists(ns.pfxChainKey)
+	chainBucket, err := tx.CreateTopLevelBucket(ns.pfxChainKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1093,17 +1048,17 @@ func (ns *nurseryStore) createHeightBucket(tx *bolt.Tx,
 // getHeightBucketPath retrieves an existing height bucket from the nursery
 // store, using the provided block height. If the bucket does not exist, or any
 // bucket along its path does not exist, a nil value is returned.
-func (ns *nurseryStore) getHeightBucketPath(tx *bolt.Tx,
-	height uint32) (*bolt.Bucket, *bolt.Bucket, *bolt.Bucket) {
+func (ns *nurseryStore) getHeightBucketPath(tx kvdb.RTx,
+	height uint32) (kvdb.RBucket, kvdb.RBucket, kvdb.RBucket) {
 
 	// Retrieve the existing chain bucket for this nursery store.
-	chainBucket := tx.Bucket(ns.pfxChainKey)
+	chainBucket := tx.ReadBucket(ns.pfxChainKey)
 	if chainBucket == nil {
 		return nil, nil, nil
 	}
 
 	// Retrieve the existing channel index.
-	hghtIndex := chainBucket.Bucket(heightIndexKey)
+	hghtIndex := chainBucket.NestedReadBucket(heightIndexKey)
 	if hghtIndex == nil {
 		return nil, nil, nil
 	}
@@ -1113,15 +1068,54 @@ func (ns *nurseryStore) getHeightBucketPath(tx *bolt.Tx,
 	var heightBytes [4]byte
 	byteOrder.PutUint32(heightBytes[:], height)
 
-	return chainBucket, hghtIndex, hghtIndex.Bucket(heightBytes[:])
+	return chainBucket, hghtIndex, hghtIndex.NestedReadBucket(heightBytes[:])
+}
+
+// getHeightBucketPathWrite retrieves an existing height bucket from the nursery
+// store, using the provided block height. If the bucket does not exist, or any
+// bucket along its path does not exist, a nil value is returned.
+func (ns *nurseryStore) getHeightBucketPathWrite(tx kvdb.RwTx,
+	height uint32) (kvdb.RwBucket, kvdb.RwBucket, kvdb.RwBucket) {
+
+	// Retrieve the existing chain bucket for this nursery store.
+	chainBucket := tx.ReadWriteBucket(ns.pfxChainKey)
+	if chainBucket == nil {
+		return nil, nil, nil
+	}
+
+	// Retrieve the existing channel index.
+	hghtIndex := chainBucket.NestedReadWriteBucket(heightIndexKey)
+	if hghtIndex == nil {
+		return nil, nil, nil
+	}
+
+	// Serialize the provided block height and return the bucket matching
+	// the serialized key.
+	var heightBytes [4]byte
+	byteOrder.PutUint32(heightBytes[:], height)
+
+	return chainBucket, hghtIndex, hghtIndex.NestedReadWriteBucket(
+		heightBytes[:],
+	)
 }
 
 // getHeightBucket retrieves an existing height bucket from the nursery store,
 // using the provided block height. If the bucket does not exist, or any bucket
 // along its path does not exist, a nil value is returned.
-func (ns *nurseryStore) getHeightBucket(tx *bolt.Tx,
-	height uint32) *bolt.Bucket {
+func (ns *nurseryStore) getHeightBucket(tx kvdb.RTx,
+	height uint32) kvdb.RBucket {
 	_, _, hghtBucket := ns.getHeightBucketPath(tx, height)
+
+	return hghtBucket
+}
+
+// getHeightBucketWrite retrieves an existing height bucket from the nursery store,
+// using the provided block height. If the bucket does not exist, or any bucket
+// along its path does not exist, a nil value is returned.
+func (ns *nurseryStore) getHeightBucketWrite(tx kvdb.RwTx,
+	height uint32) kvdb.RwBucket {
+
+	_, _, hghtBucket := ns.getHeightBucketPathWrite(tx, height)
 
 	return hghtBucket
 }
@@ -1129,8 +1123,8 @@ func (ns *nurseryStore) getHeightBucket(tx *bolt.Tx,
 // createHeightChanBucket creates or retrieves an existing height-channel bucket
 // for the provided block height and channel point. This method will attempt to
 // instantiate all buckets along the path if required.
-func (ns *nurseryStore) createHeightChanBucket(tx *bolt.Tx,
-	height uint32, chanPoint *wire.OutPoint) (*bolt.Bucket, error) {
+func (ns *nurseryStore) createHeightChanBucket(tx kvdb.RwTx,
+	height uint32, chanPoint *wire.OutPoint) (kvdb.RwBucket, error) {
 
 	// Ensure that the height bucket for this nursery store exists.
 	hghtBucket, err := ns.createHeightBucket(tx, height)
@@ -1151,15 +1145,15 @@ func (ns *nurseryStore) createHeightChanBucket(tx *bolt.Tx,
 	return hghtBucket.CreateBucketIfNotExists(chanBytes)
 }
 
-// getHeightChanBucket retrieves an existing height-channel bucket from the
+// getHeightChanBucketWrite retrieves an existing height-channel bucket from the
 // nursery store, using the provided block height and channel point. if the
 // bucket does not exist, or any bucket along its path does not exist, a nil
 // value is returned.
-func (ns *nurseryStore) getHeightChanBucket(tx *bolt.Tx,
-	height uint32, chanPoint *wire.OutPoint) *bolt.Bucket {
+func (ns *nurseryStore) getHeightChanBucketWrite(tx kvdb.RwTx,
+	height uint32, chanPoint *wire.OutPoint) kvdb.RwBucket {
 
 	// Retrieve the existing height bucket from this nursery store.
-	hghtBucket := ns.getHeightBucket(tx, height)
+	hghtBucket := ns.getHeightBucketWrite(tx, height)
 	if hghtBucket == nil {
 		return nil
 	}
@@ -1174,7 +1168,7 @@ func (ns *nurseryStore) getHeightChanBucket(tx *bolt.Tx,
 
 	// Finally, return the height bucket specified by the serialized channel
 	// point.
-	return hghtBucket.Bucket(chanBytes)
+	return hghtBucket.NestedReadWriteBucket(chanBytes)
 }
 
 // forEachHeightPrefix enumerates all outputs at the given height whose state
@@ -1182,7 +1176,7 @@ func (ns *nurseryStore) getHeightChanBucket(tx *bolt.Tx,
 // enumerate crib and kindergarten outputs at a particular height. The callback
 // is invoked with serialized bytes retrieved for each output of interest,
 // allowing the caller to deserialize them into the appropriate type.
-func (ns *nurseryStore) forEachHeightPrefix(tx *bolt.Tx, prefix []byte,
+func (ns *nurseryStore) forEachHeightPrefix(tx kvdb.RTx, prefix []byte,
 	height uint32, callback func([]byte) error) error {
 
 	// Start by retrieving the height bucket corresponding to the provided
@@ -1210,7 +1204,7 @@ func (ns *nurseryStore) forEachHeightPrefix(tx *bolt.Tx, prefix []byte,
 	// Additionally, grab the chain index, which we will facilitate queries
 	// for each of the channel buckets of each of the channels in the list
 	// we assembled above.
-	chanIndex := chainBucket.Bucket(channelIndexKey)
+	chanIndex := chainBucket.NestedReadBucket(channelIndexKey)
 	if chanIndex == nil {
 		return errors.New("unable to retrieve channel index")
 	}
@@ -1223,7 +1217,7 @@ func (ns *nurseryStore) forEachHeightPrefix(tx *bolt.Tx, prefix []byte,
 	for _, chanBytes := range channelsAtHeight {
 		// Retrieve the height-channel bucket for this channel, which
 		// holds a sub-bucket for all outputs maturing at this height.
-		hghtChanBucket := hghtBucket.Bucket(chanBytes)
+		hghtChanBucket := hghtBucket.NestedReadBucket(chanBytes)
 		if hghtChanBucket == nil {
 			return fmt.Errorf("unable to retrieve height-channel "+
 				"bucket at height %d for %x", height, chanBytes)
@@ -1232,7 +1226,7 @@ func (ns *nurseryStore) forEachHeightPrefix(tx *bolt.Tx, prefix []byte,
 		// Load the appropriate channel bucket from the channel index,
 		// this will allow us to retrieve the individual serialized
 		// outputs.
-		chanBucket := chanIndex.Bucket(chanBytes)
+		chanBucket := chanIndex.NestedReadBucket(chanBytes)
 		if chanBucket == nil {
 			return fmt.Errorf("unable to retrieve channel "+
 				"bucket: '%x'", chanBytes)
@@ -1242,7 +1236,7 @@ func (ns *nurseryStore) forEachHeightPrefix(tx *bolt.Tx, prefix []byte,
 		// prefix, we will perform a prefix scan of the buckets
 		// contained in the height-channel bucket, efficiently
 		// enumerating the desired outputs.
-		c := hghtChanBucket.Cursor()
+		c := hghtChanBucket.ReadCursor()
 		for k, _ := c.Seek(prefix); bytes.HasPrefix(
 			k, prefix); k, _ = c.Next() {
 
@@ -1270,7 +1264,7 @@ func (ns *nurseryStore) forEachHeightPrefix(tx *bolt.Tx, prefix []byte,
 // provided callback. The callback accepts a key-value pair of byte slices
 // corresponding to the prefixed-output key and the serialized output,
 // respectively.
-func (ns *nurseryStore) forChanOutputs(tx *bolt.Tx, chanPoint *wire.OutPoint,
+func (ns *nurseryStore) forChanOutputs(tx kvdb.RTx, chanPoint *wire.OutPoint,
 	callback func([]byte, []byte) error) error {
 
 	chanBucket := ns.getChannelBucket(tx, chanPoint)
@@ -1281,145 +1275,6 @@ func (ns *nurseryStore) forChanOutputs(tx *bolt.Tx, chanPoint *wire.OutPoint,
 	return chanBucket.ForEach(callback)
 }
 
-// getLastFinalizedHeight is a helper method that retrieves the last height for
-// which the database finalized its persistent state.
-func (ns *nurseryStore) getLastFinalizedHeight(tx *bolt.Tx) (uint32, error) {
-	// Retrieve the chain bucket associated with the given nursery store.
-	chainBucket := tx.Bucket(ns.pfxChainKey)
-	if chainBucket == nil {
-		return 0, nil
-	}
-
-	// Lookup the last finalized height in the top-level chain bucket.
-	heightBytes := chainBucket.Get(lastFinalizedHeightKey)
-	if heightBytes == nil {
-		// We have never finalized, return height 0.
-		return 0, nil
-	}
-
-	// If the resulting bytes are not sized like a uint32, then we have
-	// never finalized, so we return 0.
-
-	// Otherwise, parse the bytes and return the last finalized height.
-	return byteOrder.Uint32(heightBytes), nil
-}
-
-// finalizeKinder records a finalized kingergarten sweep txn to the given height
-// bucket. It also updates the nursery store's last finalized height, so that we
-// do not finalize the same height twice. If the finalized txn is nil, i.e. if
-// the height has no kindergarten outputs, the height will be marked as
-// finalized, and we skip the process of writing the txn. When the class is
-// loaded, a nil value will be returned if no txn has been written to a
-// finalized height bucket.
-func (ns *nurseryStore) finalizeKinder(tx *bolt.Tx, height uint32,
-	finalTx *wire.MsgTx) error {
-
-	// TODO(conner) ensure height is greater that current finalized height.
-
-	// 1. Write the last finalized height to the chain bucket.
-
-	// Ensure that the chain bucket for this nursery store exists.
-	chainBucket, err := tx.CreateBucketIfNotExists(ns.pfxChainKey)
-	if err != nil {
-		return err
-	}
-
-	// Serialize the provided last-finalized height, and store it in the
-	// top-level chain bucket for this nursery store.
-	var lastHeightBytes [4]byte
-	byteOrder.PutUint32(lastHeightBytes[:], height)
-
-	err = chainBucket.Put(lastFinalizedHeightKey, lastHeightBytes[:])
-	if err != nil {
-		return err
-	}
-
-	// 2. Write the finalized txn in the appropriate height bucket.
-
-	// If there is no finalized txn, we have nothing to do.
-	if finalTx == nil {
-		return nil
-	}
-
-	// Otherwise serialize the finalized txn and write it to the height
-	// bucket.
-	hghtBucket := ns.getHeightBucket(tx, height)
-	if hghtBucket == nil {
-		return nil
-	}
-
-	var finalTxnBuf bytes.Buffer
-	if err := finalTx.Serialize(&finalTxnBuf); err != nil {
-		return err
-	}
-
-	return hghtBucket.Put(finalizedKndrTxnKey, finalTxnBuf.Bytes())
-}
-
-// getFinalizedTxn retrieves the finalized kindergarten sweep txn at the given
-// height, returning nil if one was not found.
-func (ns *nurseryStore) getFinalizedTxn(tx *bolt.Tx,
-	height uint32) (*wire.MsgTx, error) {
-
-	hghtBucket := ns.getHeightBucket(tx, height)
-	if hghtBucket == nil {
-		// No class to finalize.
-		return nil, nil
-	}
-
-	finalTxBytes := hghtBucket.Get(finalizedKndrTxnKey)
-	if finalTxBytes == nil {
-		// No finalized txn for this height.
-		return nil, nil
-	}
-
-	// Otherwise, deserialize and return the finalized transaction.
-	txn := &wire.MsgTx{}
-	if err := txn.Deserialize(bytes.NewReader(finalTxBytes)); err != nil {
-		return nil, err
-	}
-
-	return txn, nil
-}
-
-// getLastGraduatedHeight is a helper method that retrieves the last height for
-// which the database graduated all outputs successfully.
-func (ns *nurseryStore) getLastGraduatedHeight(tx *bolt.Tx) (uint32, error) {
-	// Retrieve the chain bucket associated with the given nursery store.
-	chainBucket := tx.Bucket(ns.pfxChainKey)
-	if chainBucket == nil {
-		return 0, nil
-	}
-
-	// Lookup the last graduated height in the top-level chain bucket.
-	heightBytes := chainBucket.Get(lastGraduatedHeightKey)
-	if heightBytes == nil {
-		// We have never graduated before, return height 0.
-		return 0, nil
-	}
-
-	// Otherwise, parse the bytes and return the last graduated height.
-	return byteOrder.Uint32(heightBytes), nil
-}
-
-// pubLastGraduatedHeight is a helper method that writes the provided height under
-// the last graduated height key.
-func (ns *nurseryStore) putLastGraduatedHeight(tx *bolt.Tx, height uint32) error {
-
-	// Ensure that the chain bucket for this nursery store exists.
-	chainBucket, err := tx.CreateBucketIfNotExists(ns.pfxChainKey)
-	if err != nil {
-		return err
-	}
-
-	// Serialize the provided last-gradauted height, and store it in the
-	// top-level chain bucket for this nursery store.
-	var lastHeightBytes [4]byte
-	byteOrder.PutUint32(lastHeightBytes[:], height)
-
-	return chainBucket.Put(lastGraduatedHeightKey, lastHeightBytes[:])
-}
-
 // errBucketNotEmpty signals that an attempt to prune a particular
 // bucket failed because it still has active outputs.
 var errBucketNotEmpty = errors.New("bucket is not empty, cannot be pruned")
@@ -1427,11 +1282,11 @@ var errBucketNotEmpty = errors.New("bucket is not empty, cannot be pruned")
 // removeOutputFromHeight will delete the given output from the specified
 // height-channel bucket, and attempt to prune the upstream directories if they
 // are empty.
-func (ns *nurseryStore) removeOutputFromHeight(tx *bolt.Tx, height uint32,
+func (ns *nurseryStore) removeOutputFromHeight(tx kvdb.RwTx, height uint32,
 	chanPoint *wire.OutPoint, pfxKey []byte) error {
 
 	// Retrieve the height-channel bucket and delete the prefixed output.
-	hghtChanBucket := ns.getHeightChanBucket(tx, height, chanPoint)
+	hghtChanBucket := ns.getHeightChanBucketWrite(tx, height, chanPoint)
 	if hghtChanBucket == nil {
 		// Height-channel bucket already removed.
 		return nil
@@ -1444,7 +1299,7 @@ func (ns *nurseryStore) removeOutputFromHeight(tx *bolt.Tx, height uint32,
 	}
 
 	// Retrieve the height bucket that contains the height-channel bucket.
-	hghtBucket := ns.getHeightBucket(tx, height)
+	hghtBucket := ns.getHeightBucketWrite(tx, height)
 	if hghtBucket == nil {
 		return errors.New("height bucket not found")
 	}
@@ -1479,9 +1334,9 @@ func (ns *nurseryStore) removeOutputFromHeight(tx *bolt.Tx, height uint32,
 // all active outputs at this height have been removed from their respective
 // height-channel buckets. The returned boolean value indicated whether or not
 // this invocation successfully pruned the height bucket.
-func (ns *nurseryStore) pruneHeight(tx *bolt.Tx, height uint32) (bool, error) {
+func (ns *nurseryStore) pruneHeight(tx kvdb.RwTx, height uint32) (bool, error) {
 	// Fetch the existing height index and height bucket.
-	_, hghtIndex, hghtBucket := ns.getHeightBucketPath(tx, height)
+	_, hghtIndex, hghtBucket := ns.getHeightBucketPathWrite(tx, height)
 	if hghtBucket == nil {
 		return false, nil
 	}
@@ -1490,14 +1345,15 @@ func (ns *nurseryStore) pruneHeight(tx *bolt.Tx, height uint32) (bool, error) {
 	// attempt to remove each one if they are empty, keeping track of the
 	// number of height-channel buckets that still have active outputs.
 	if err := hghtBucket.ForEach(func(chanBytes, v []byte) error {
-		// Skip the finalized txn key.
+		// Skip the finalized txn key if it still exists from a previous
+		// db version.
 		if v != nil {
 			return nil
 		}
 
 		// Attempt to each height-channel bucket from the height bucket
 		// located above.
-		hghtChanBucket := hghtBucket.Bucket(chanBytes)
+		hghtChanBucket := hghtBucket.NestedReadWriteBucket(chanBytes)
 		if hghtChanBucket == nil {
 			return errors.New("unable to find height-channel bucket")
 		}
@@ -1525,9 +1381,9 @@ func (ns *nurseryStore) pruneHeight(tx *bolt.Tx, height uint32) (bool, error) {
 
 // removeBucketIfEmpty attempts to delete a bucket specified by name from the
 // provided parent bucket.
-func removeBucketIfEmpty(parent *bolt.Bucket, bktName []byte) error {
+func removeBucketIfEmpty(parent kvdb.RwBucket, bktName []byte) error {
 	// Attempt to fetch the named bucket from its parent.
-	bkt := parent.Bucket(bktName)
+	bkt := parent.NestedReadWriteBucket(bktName)
 	if bkt == nil {
 		// No bucket was found, already removed?
 		return nil
@@ -1538,25 +1394,25 @@ func removeBucketIfEmpty(parent *bolt.Bucket, bktName []byte) error {
 		return err
 	}
 
-	return parent.DeleteBucket(bktName)
+	return parent.DeleteNestedBucket(bktName)
 }
 
 // removeBucketIfExists safely deletes the named bucket by first checking
 // that it exists in the parent bucket.
-func removeBucketIfExists(parent *bolt.Bucket, bktName []byte) error {
+func removeBucketIfExists(parent kvdb.RwBucket, bktName []byte) error {
 	// Attempt to fetch the named bucket from its parent.
-	bkt := parent.Bucket(bktName)
+	bkt := parent.NestedReadWriteBucket(bktName)
 	if bkt == nil {
 		// No bucket was found, already removed?
 		return nil
 	}
 
-	return parent.DeleteBucket(bktName)
+	return parent.DeleteNestedBucket(bktName)
 }
 
 // isBucketEmpty returns errBucketNotEmpty if the bucket has a non-zero number
 // of children.
-func isBucketEmpty(parent *bolt.Bucket) error {
+func isBucketEmpty(parent kvdb.RBucket) error {
 	return parent.ForEach(func(_, _ []byte) error {
 		return errBucketNotEmpty
 	})

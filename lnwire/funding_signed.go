@@ -1,10 +1,6 @@
 package lnwire
 
-import (
-	"io"
-
-	"github.com/roasbeef/btcd/btcec"
-)
+import "io"
 
 // FundingSigned is sent from Bob (the responder) to Alice (the initiator)
 // after receiving the funding outpoint and her signature for Bob's version of
@@ -16,7 +12,7 @@ type FundingSigned struct {
 
 	// CommitSig is Bob's signature for Alice's version of the commitment
 	// transaction.
-	CommitSig *btcec.Signature
+	CommitSig Sig
 }
 
 // A compile time check to ensure FundingSigned implements the lnwire.Message
@@ -29,7 +25,7 @@ var _ Message = (*FundingSigned)(nil)
 //
 // This is part of the lnwire.Message interface.
 func (f *FundingSigned) Encode(w io.Writer, pver uint32) error {
-	return writeElements(w, f.ChanID, f.CommitSig)
+	return WriteElements(w, f.ChanID, f.CommitSig)
 }
 
 // Decode deserializes the serialized FundingSigned stored in the passed
@@ -38,7 +34,7 @@ func (f *FundingSigned) Encode(w io.Writer, pver uint32) error {
 //
 // This is part of the lnwire.Message interface.
 func (f *FundingSigned) Decode(r io.Reader, pver uint32) error {
-	return readElements(r, &f.ChanID, &f.CommitSig)
+	return ReadElements(r, &f.ChanID, &f.CommitSig)
 }
 
 // MsgType returns the uint32 code which uniquely identifies this message as a

@@ -7,32 +7,9 @@ import "github.com/go-errors/errors"
 type errorCode uint8
 
 const (
-	// ErrNoPathFound is returned when a path to the target destination
-	// does not exist in the graph.
-	ErrNoPathFound errorCode = iota
-
-	// ErrNoRouteFound is returned when the router is unable to find a
-	// valid route to the target destination after fees and time-lock
-	// limitations are factored in.
-	ErrNoRouteFound
-
-	// ErrInsufficientCapacity is returned when a path if found, yet the
-	// capacity of one of the channels in the path is insufficient to carry
-	// the payment.
-	ErrInsufficientCapacity
-
-	// ErrMaxHopsExceeded is returned when a candidate path is found, but
-	// the length of that path exceeds HopLimit.
-	ErrMaxHopsExceeded
-
-	// ErrTargetNotInNetwork is returned when the target of a path-finding
-	// or payment attempt isn't known to be within the current version of
-	// the channel graph.
-	ErrTargetNotInNetwork
-
 	// ErrOutdated is returned when the routing update already have
-	// been applied.
-	ErrOutdated
+	// been applied, or a newer update is already known.
+	ErrOutdated errorCode = iota
 
 	// ErrIgnored is returned when the update have been ignored because
 	// this update can't bring us something new, or because a node
@@ -57,16 +34,7 @@ func (e *routerError) Error() string {
 // A compile time check to ensure routerError implements the error interface.
 var _ error = (*routerError)(nil)
 
-// newErr creates an routerError by the given error description and its
-// corresponding error code.
-func newErr(code errorCode, a interface{}) *routerError {
-	return &routerError{
-		code: code,
-		err:  errors.New(a),
-	}
-}
-
-// newErrf creates an routerError by the given error formatted description and
+// newErrf creates a routerError by the given error formatted description and
 // its corresponding error code.
 func newErrf(code errorCode, format string, a ...interface{}) *routerError {
 	return &routerError{
