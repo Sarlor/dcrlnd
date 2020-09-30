@@ -44,8 +44,12 @@ RPCPASS=$(set_default "$RPCPASS" "devpass")
 DEBUG=$(set_default "$DEBUG" "info")
 NETWORK=$(set_default "$NETWORK" "simnet")
 
-PARAMS=$(echo \
-    "--$NETWORK" \
+PARAMS=""
+if [ "$NETWORK" != "mainnet" ]; then
+   PARAMS="--$NETWORK"
+fi
+
+PARAMS=$(echo $PARAMS \
     "--debuglevel=$DEBUG" \
     "--rpcuser=$RPCUSER" \
     "--rpcpass=$RPCPASS" \
@@ -53,7 +57,8 @@ PARAMS=$(echo \
     "--logdir=/data" \
     "--rpccert=/rpc/rpc.cert" \
     "--rpckey=/rpc/rpc.key" \
-    "--rpclisten=0.0.0.0"
+    "--rpclisten=0.0.0.0" \
+    "--txindex"
 )
 
 # Set the mining flag only if address is non empty.
@@ -66,5 +71,4 @@ PARAMS="$PARAMS $@"
 
 # Print command and start bitcoin node.
 echo "Command: ltcd $PARAMS"
-ltcd $PARAMS
-
+exec ltcd $PARAMS

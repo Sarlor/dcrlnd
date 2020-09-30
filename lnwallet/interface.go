@@ -4,18 +4,19 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
+	"github.com/btcsuite/btcwallet/wallet/txauthor"
+	"github.com/btcsuite/btcwallet/wtxmgr"
+	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
 
-// ErrNotMine is an error denoting that a WalletController instance is unable
-// to spend a specified output.
-var ErrNotMine = errors.New("the passed output doesn't belong to the wallet")
-
-// AddressType is a enum-like type which denotes the possible address types
+// AddressType is an enum-like type which denotes the possible address types
 // WalletController supports.
 type AddressType uint8
 
@@ -30,19 +31,38 @@ const (
 	// NestedWitnessPubKey represents a p2sh output which is itself a
 	// nested p2wkh output.
 	NestedWitnessPubKey
-
-	// PubKeyHash represents a regular p2pkh output.
-	PubKeyHash
 )
+
+var (
+	// DefaultPublicPassphrase is the default public passphrase used for the
+	// wallet.
+	DefaultPublicPassphrase = []byte("public")
+
+	// DefaultPrivatePassphrase is the default private passphrase used for
+	// the wallet.
+	DefaultPrivatePassphrase = []byte("hello")
+
+	// ErrDoubleSpend is returned from PublishTransaction in case the
+	// tx being published is spending an output spent by a conflicting
+	// transaction.
+	ErrDoubleSpend = errors.New("transaction rejected: output already spent")
+
+	// ErrNotMine is an error denoting that a WalletController instance is
+	// unable to spend a specified output.
+	ErrNotMine = errors.New("the passed output doesn't belong to the wallet")
+)
+
+// ErrNoOutputs is returned if we try to create a transaction with no outputs
+// or send coins to a set of outputs that is empty.
+var ErrNoOutputs = errors.New("no outputs")
 
 // Utxo is an unspent output denoted by its outpoint, and output value of the
 // original output.
 type Utxo struct {
 	AddressType   AddressType
 	Value         btcutil.Amount
+	Confirmations int64
 	PkScript      []byte
-	RedeemScript  []byte
-	WitnessScript []byte
 	wire.OutPoint
 }
 
@@ -82,6 +102,12 @@ type TransactionDetail struct {
 
 	// DestAddresses are the destinations for a transaction
 	DestAddresses []btcutil.Address
+
+	// RawTx returns the raw serialized transaction.
+	RawTx []byte
+
+	// Label is an optional transaction label.
+	Label string
 }
 
 // TransactionSubscription is an interface which describes an object capable of
@@ -114,76 +140,133 @@ type TransactionSubscription interface {
 type WalletController interface {
 	// FetchInputInfo queries for the WalletController's knowledge of the
 	// passed outpoint. If the base wallet determines this output is under
-	// its control, then the original txout should be returned. Otherwise,
+	// its control, then the original txout should be returned.  Otherwise,
 	// a non-nil error value of ErrNotMine should be returned instead.
-	FetchInputInfo(prevOut *wire.OutPoint) (*wire.TxOut, error)
+	FetchInputInfo(prevOut *wire.OutPoint) (*Utxo, error)
 
 	// ConfirmedBalance returns the sum of all the wallet's unspent outputs
 	// that have at least confs confirmations. If confs is set to zero,
 	// then all unspent outputs, including those currently in the mempool
 	// will be included in the final sum.
-	ConfirmedBalance(confs int32, witness bool) (btcutil.Amount, error)
+	//
+	// NOTE: Only witness outputs should be included in the computation of
+	// the total spendable balance of the wallet. We require this as only
+	// witness inputs can be used for funding channels.
+	ConfirmedBalance(confs int32) (btcutil.Amount, error)
 
 	// NewAddress returns the next external or internal address for the
 	// wallet dictated by the value of the `change` parameter. If change is
 	// true, then an internal address should be used, otherwise an external
 	// address should be returned. The type of address returned is dictated
-	// by the wallet's capabilities, and may be of type: p2sh, p2pkh,
-	// p2wkh, p2wsh, etc.
+	// by the wallet's capabilities, and may be of type: p2sh, p2wkh,
+	// p2wsh, etc.
 	NewAddress(addrType AddressType, change bool) (btcutil.Address, error)
 
-	// GetPrivKey retrieves the underlying private key associated with the
-	// passed address. If the wallet is unable to locate this private key
-	// due to the address not being under control of the wallet, then an
-	// error should be returned.
-	GetPrivKey(a btcutil.Address) (*btcec.PrivateKey, error)
+	// LastUnusedAddress returns the last *unused* address known by the
+	// wallet. An address is unused if it hasn't received any payments.
+	// This can be useful in UIs in order to continually show the
+	// "freshest" address without having to worry about "address inflation"
+	// caused by continual refreshing. Similar to NewAddress it can derive
+	// a specified address type. By default, this is a non-change address.
+	LastUnusedAddress(addrType AddressType) (btcutil.Address, error)
 
-	// NewRawKey returns a raw private key controlled by the wallet. These
-	// keys are used for the 2-of-2 multi-sig outputs for funding
-	// transactions, as well as the pub key used for commitment transactions.
+	// IsOurAddress checks if the passed address belongs to this wallet
+	IsOurAddress(a btcutil.Address) bool
+
+	// SendOutputs funds, signs, and broadcasts a Bitcoin transaction paying
+	// out to the specified outputs. In the case the wallet has insufficient
+	// funds, or the outputs are non-standard, an error should be returned.
+	// This method also takes the target fee expressed in sat/kw that should
+	// be used when crafting the transaction.
 	//
-	// NOTE: The wallet MUST watch for on-chain outputs created to a p2wpkh
-	// script using keys returned by this function.
-	NewRawKey() (*btcec.PublicKey, error)
-
-	// FetchRootKey returns a root key which will be used by the
-	// LightningWallet to deterministically generate secrets. The private
-	// key returned by this method should remain constant in-between
-	// WalletController restarts.
-	FetchRootKey() (*btcec.PrivateKey, error)
-
-	// SendOutputs funds, signs, and broadcasts a Bitcoin transaction
-	// paying out to the specified outputs. In the case the wallet has
-	// insufficient funds, or the outputs are non-standard, an error should
-	// be returned. This method also takes the target fee expressed in
-	// sat/byte that should be used when crafting the transaction.
+	// NOTE: This method requires the global coin selection lock to be held.
 	SendOutputs(outputs []*wire.TxOut,
-		feeSatPerByte btcutil.Amount) (*chainhash.Hash, error)
+		feeRate chainfee.SatPerKWeight, label string) (*wire.MsgTx, error)
+
+	// CreateSimpleTx creates a Bitcoin transaction paying to the specified
+	// outputs. The transaction is not broadcasted to the network. In the
+	// case the wallet has insufficient funds, or the outputs are
+	// non-standard, an error should be returned. This method also takes
+	// the target fee expressed in sat/kw that should be used when crafting
+	// the transaction.
+	//
+	// NOTE: The dryRun argument can be set true to create a tx that
+	// doesn't alter the database. A tx created with this set to true
+	// SHOULD NOT be broadcasted.
+	//
+	// NOTE: This method requires the global coin selection lock to be held.
+	CreateSimpleTx(outputs []*wire.TxOut, feeRate chainfee.SatPerKWeight,
+		dryRun bool) (*txauthor.AuthoredTx, error)
 
 	// ListUnspentWitness returns all unspent outputs which are version 0
-	// witness programs. The 'confirms' parameter indicates the minimum
-	// number of confirmations an output needs in order to be returned by
-	// this method. Passing -1 as 'confirms' indicates that even
-	// unconfirmed outputs should be returned.
-	ListUnspentWitness(confirms int32) ([]*Utxo, error)
+	// witness programs. The 'minconfirms' and 'maxconfirms' parameters
+	// indicate the minimum and maximum number of confirmations an output
+	// needs in order to be returned by this method. Passing -1 as
+	// 'minconfirms' indicates that even unconfirmed outputs should be
+	// returned. Using MaxInt32 as 'maxconfirms' implies returning all
+	// outputs with at least 'minconfirms'.
+	//
+	// NOTE: This method requires the global coin selection lock to be held.
+	ListUnspentWitness(minconfirms, maxconfirms int32) ([]*Utxo, error)
 
 	// ListTransactionDetails returns a list of all transactions which are
-	// relevant to the wallet.
-	ListTransactionDetails() ([]*TransactionDetail, error)
+	// relevant to the wallet over [startHeight;endHeight]. If start height
+	// is greater than end height, the transactions will be retrieved in
+	// reverse order. To include unconfirmed transactions, endHeight should
+	// be set to the special value -1. This will return transactions from
+	// the tip of the chain until the start height (inclusive) and
+	// unconfirmed transactions.
+	ListTransactionDetails(startHeight,
+		endHeight int32) ([]*TransactionDetail, error)
 
 	// LockOutpoint marks an outpoint as locked meaning it will no longer
 	// be deemed as eligible for coin selection. Locking outputs are
 	// utilized in order to avoid race conditions when selecting inputs for
 	// usage when funding a channel.
+	//
+	// NOTE: This method requires the global coin selection lock to be held.
 	LockOutpoint(o wire.OutPoint)
 
-	// UnlockOutpoint unlocks an previously locked output, marking it
+	// UnlockOutpoint unlocks a previously locked output, marking it
 	// eligible for coin selection.
+	//
+	// NOTE: This method requires the global coin selection lock to be held.
 	UnlockOutpoint(o wire.OutPoint)
+
+	// LeaseOutput locks an output to the given ID, preventing it from being
+	// available for any future coin selection attempts. The absolute time
+	// of the lock's expiration is returned. The expiration of the lock can
+	// be extended by successive invocations of this call. Outputs can be
+	// unlocked before their expiration through `ReleaseOutput`.
+	//
+	// If the output is not known, wtxmgr.ErrUnknownOutput is returned. If
+	// the output has already been locked to a different ID, then
+	// wtxmgr.ErrOutputAlreadyLocked is returned.
+	//
+	// NOTE: This method requires the global coin selection lock to be held.
+	LeaseOutput(id wtxmgr.LockID, op wire.OutPoint) (time.Time, error)
+
+	// ReleaseOutput unlocks an output, allowing it to be available for coin
+	// selection if it remains unspent. The ID should match the one used to
+	// originally lock the output.
+	//
+	// NOTE: This method requires the global coin selection lock to be held.
+	ReleaseOutput(id wtxmgr.LockID, op wire.OutPoint) error
 
 	// PublishTransaction performs cursory validation (dust checks, etc),
 	// then finally broadcasts the passed transaction to the Bitcoin network.
-	PublishTransaction(tx *wire.MsgTx) error
+	// If the transaction is rejected because it is conflicting with an
+	// already known transaction, ErrDoubleSpend is returned. If the
+	// transaction is already known (published already), no error will be
+	// returned. Other error returned depends on the currently active chain
+	// backend. It takes an optional label which will save a label with the
+	// published transaction.
+	PublishTransaction(tx *wire.MsgTx, label string) error
+
+	// LabelTransaction adds a label to a transaction. If the tx already
+	// has a label, this call will fail unless the overwrite parameter
+	// is set. Labels must not be empty, and they are limited to 500 chars.
+	LabelTransaction(hash chainhash.Hash, label string, overwrite bool) error
 
 	// SubscribeTransactions returns a TransactionSubscription client which
 	// is capable of receiving async notifications as new transactions
@@ -198,7 +281,14 @@ type WalletController interface {
 
 	// IsSynced returns a boolean indicating if from the PoV of the wallet,
 	// it has fully synced to the current best block in the main chain.
-	IsSynced() (bool, error)
+	// It also returns an int64 indicating the timestamp of the best block
+	// known to the wallet, expressed in Unix epoch time
+	IsSynced() (bool, int64, error)
+
+	// GetRecoveryInfo returns a boolean indicating whether the wallet is
+	// started in recovery mode. It also returns a float64 indicating the
+	// recovery progress made so far.
+	GetRecoveryInfo() (bool, float64, error)
 
 	// Start initializes the wallet, making any necessary connections,
 	// starting up required goroutines etc.
@@ -228,10 +318,14 @@ type BlockChainIO interface {
 
 	// GetUtxo attempts to return the passed outpoint if it's still a
 	// member of the utxo set. The passed height hint should be the "birth
-	// height" of the passed outpoint. In the case that the output is in
+	// height" of the passed outpoint. The script passed should be the
+	// script that the outpoint creates. In the case that the output is in
 	// the UTXO set, then the output corresponding to that output is
 	// returned.  Otherwise, a non-nil error will be returned.
-	GetUtxo(op *wire.OutPoint, heightHint uint32) (*wire.TxOut, error)
+	// As for some backends this call can initiate a rescan, the passed
+	// cancel channel can be closed to abort the call.
+	GetUtxo(op *wire.OutPoint, pkScript []byte, heightHint uint32,
+		cancel <-chan struct{}) (*wire.TxOut, error)
 
 	// GetBlockHash returns the hash of the block in the best blockchain
 	// at the given height.
@@ -240,30 +334,6 @@ type BlockChainIO interface {
 	// GetBlock returns the block in the main chain identified by the given
 	// hash.
 	GetBlock(blockHash *chainhash.Hash) (*wire.MsgBlock, error)
-}
-
-// Signer represents an abstract object capable of generating raw signatures as
-// well as full complete input scripts given a valid SignDescriptor and
-// transaction. This interface fully abstracts away signing paving the way for
-// Signer implementations such as hardware wallets, hardware tokens, HSM's, or
-// simply a regular wallet.
-type Signer interface {
-	// SignOutputRaw generates a signature for the passed transaction
-	// according to the data within the passed SignDescriptor.
-	//
-	// NOTE: The resulting signature should be void of a sighash byte.
-	SignOutputRaw(tx *wire.MsgTx, signDesc *SignDescriptor) ([]byte, error)
-
-	// ComputeInputScript generates a complete InputIndex for the passed
-	// transaction with the signature as defined within the passed
-	// SignDescriptor. This method should be capable of generating the
-	// proper input script for both regular p2wkh output and p2wkh outputs
-	// nested within a regular p2sh output.
-	//
-	// NOTE: This method will ignore any tweak parameters set within the
-	// passed SignDescriptor as it assumes a set of typical script
-	// templates (p2wkh, np2wkh, etc).
-	ComputeInputScript(tx *wire.MsgTx, signDesc *SignDescriptor) (*InputScript, error)
 }
 
 // MessageSigner represents an abstract object capable of signing arbitrary
@@ -275,7 +345,7 @@ type MessageSigner interface {
 	// that corresponds to the passed public key. If the target private key
 	// is unable to be found, then an error will be returned. The actual
 	// digest signed is the double SHA-256 of the passed message.
-	SignMessage(pubKey *btcec.PublicKey, msg []byte) (*btcec.Signature, error)
+	SignMessage(pubKey *btcec.PublicKey, msg []byte) (input.Signature, error)
 }
 
 // WalletDriver represents a "driver" for a particular concrete
@@ -283,8 +353,8 @@ type MessageSigner interface {
 // string identifier along with a 'New()' method which is responsible for
 // initializing a particular WalletController concrete implementation.
 type WalletDriver struct {
-	// WalletType is a string which uniquely identifies the WalletController
-	// that this driver, drives.
+	// WalletType is a string which uniquely identifies the
+	// WalletController that this driver, drives.
 	WalletType string
 
 	// New creates a new instance of a concrete WalletController

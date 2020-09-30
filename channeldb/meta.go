@@ -1,7 +1,7 @@
 package channeldb
 
 import (
-	"github.com/boltdb/bolt"
+	"github.com/lightningnetwork/lnd/channeldb/kvdb"
 )
 
 var (
@@ -22,10 +22,10 @@ type Meta struct {
 
 // FetchMeta fetches the meta data from boltdb and returns filled meta
 // structure.
-func (d *DB) FetchMeta(tx *bolt.Tx) (*Meta, error) {
+func (d *DB) FetchMeta(tx kvdb.RTx) (*Meta, error) {
 	meta := &Meta{}
 
-	err := d.View(func(tx *bolt.Tx) error {
+	err := kvdb.View(d, func(tx kvdb.RTx) error {
 		return fetchMeta(meta, tx)
 	})
 	if err != nil {
@@ -38,8 +38,8 @@ func (d *DB) FetchMeta(tx *bolt.Tx) (*Meta, error) {
 // fetchMeta is an internal helper function used in order to allow callers to
 // re-use a database transaction. See the publicly exported FetchMeta method
 // for more information.
-func fetchMeta(meta *Meta, tx *bolt.Tx) error {
-	metaBucket := tx.Bucket(metaBucket)
+func fetchMeta(meta *Meta, tx kvdb.RTx) error {
+	metaBucket := tx.ReadBucket(metaBucket)
 	if metaBucket == nil {
 		return ErrMetaNotFound
 	}
@@ -56,7 +56,7 @@ func fetchMeta(meta *Meta, tx *bolt.Tx) error {
 
 // PutMeta writes the passed instance of the database met-data struct to disk.
 func (d *DB) PutMeta(meta *Meta) error {
-	return d.Update(func(tx *bolt.Tx) error {
+	return kvdb.Update(d, func(tx kvdb.RwTx) error {
 		return putMeta(meta, tx)
 	})
 }
@@ -64,8 +64,8 @@ func (d *DB) PutMeta(meta *Meta) error {
 // putMeta is an internal helper function used in order to allow callers to
 // re-use a database transaction. See the publicly exported PutMeta method for
 // more information.
-func putMeta(meta *Meta, tx *bolt.Tx) error {
-	metaBucket, err := tx.CreateBucketIfNotExists(metaBucket)
+func putMeta(meta *Meta, tx kvdb.RwTx) error {
+	metaBucket, err := tx.CreateTopLevelBucket(metaBucket)
 	if err != nil {
 		return err
 	}
@@ -73,7 +73,7 @@ func putMeta(meta *Meta, tx *bolt.Tx) error {
 	return putDbVersion(metaBucket, meta)
 }
 
-func putDbVersion(metaBucket *bolt.Bucket, meta *Meta) error {
+func putDbVersion(metaBucket kvdb.RwBucket, meta *Meta) error {
 	scratch := make([]byte, 4)
 	byteOrder.PutUint32(scratch, meta.DbVersionNumber)
 	return metaBucket.Put(dbVersionKey, scratch)

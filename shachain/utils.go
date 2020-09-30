@@ -3,27 +3,8 @@ package shachain
 import (
 	"encoding/hex"
 
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 )
-
-// changeBit is a functio that function that flips a bit of the hash at a
-// particluar bit-index. You should be aware that the bit flipping in this
-// function a bit strange, example:
-// hash: [0b00000000, 0b00000000,  ... 0b00000000]
-//	    0		   1       ...      31
-//
-// byte: 0 0 0 0 0 0 0 0
-// 	 7 6 5 4 3 2 1 0
-//
-// By flipping the bit at 7 position you will flip the first bit in hash and by
-// flipping the bit at 8 position you will flip the 16 bit in hash.
-func changeBit(hash []byte, position uint8) []byte {
-	byteNumber := position / 8
-	bitNumber := position % 8
-
-	hash[byteNumber] ^= (1 << bitNumber)
-	return hash
-}
 
 // getBit return bit on index at position.
 func getBit(index index, position uint8) uint8 {
@@ -50,7 +31,7 @@ func getPrefix(index index, position uint8) uint64 {
 	return (uint64(index) & mask)
 }
 
-// countTrailingZeros count number of of trailing zero bits, this function is
+// countTrailingZeros counts number of trailing zero bits, this function is
 // used to determine the number of element bucket.
 func countTrailingZeros(index index) uint8 {
 	var zeros uint8
@@ -64,7 +45,7 @@ func countTrailingZeros(index index) uint8 {
 	return zeros
 }
 
-// hashFromString takes a hex-encoded string as input and creates an instane of
+// hashFromString takes a hex-encoded string as input and creates an instance of
 // chainhash.Hash. The chainhash.NewHashFromStr function not suitable because
 // it reverse the given hash.
 func hashFromString(s string) (*chainhash.Hash, error) {

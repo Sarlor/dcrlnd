@@ -7,31 +7,21 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/btcsuite/btcd/btcjson"
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/rpcclient"
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 	"github.com/lightningnetwork/lnd/chainntnfs"
-	"github.com/roasbeef/btcd/btcjson"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/rpcclient"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
+	"github.com/lightningnetwork/lnd/queue"
 )
 
 const (
-
 	// notifierType uniquely identifies this concrete implementation of the
 	// ChainNotifier interface.
 	notifierType = "btcd"
-
-	// reorgSafetyLimit is assumed maximum depth of a chain reorganization.
-	// After this many confirmation, transaction confirmation info will be
-	// pruned.
-	reorgSafetyLimit = 100
-)
-
-var (
-	// ErrChainNotifierShuttingDown is used when we are trying to
-	// measure a spend notification when notifier is already stopped.
-	ErrChainNotifierShuttingDown = errors.New("chainntnfs: system interrupt " +
-		"while attempting to register for spend notification.")
 )
 
 // chainUpdate encapsulates an update to the current main chain. This struct is
@@ -61,25 +51,36 @@ type txUpdate struct {
 // notifications. Multiple concurrent clients are supported. All notifications
 // are achieved via non-blocking sends on client channels.
 type BtcdNotifier struct {
-	spendClientCounter uint64 // To be used atomically.
 	epochClientCounter uint64 // To be used atomically.
 
-	started int32 // To be used atomically.
+	start   sync.Once
+	active  int32 // To be used atomically.
 	stopped int32 // To be used atomically.
 
-	chainConn *rpcclient.Client
+	chainConn   *rpcclient.Client
+	chainParams *chaincfg.Params
 
 	notificationCancels  chan interface{}
 	notificationRegistry chan interface{}
 
-	spendNotifications map[wire.OutPoint]map[uint64]*spendNotification
-
-	txConfNotifier *chainntnfs.TxConfNotifier
+	txNotifier *chainntnfs.TxNotifier
 
 	blockEpochClients map[uint64]*blockEpochRegistration
 
-	chainUpdates *chainntnfs.ConcurrentQueue
-	txUpdates    *chainntnfs.ConcurrentQueue
+	bestBlock chainntnfs.BlockEpoch
+
+	chainUpdates *queue.ConcurrentQueue
+	txUpdates    *queue.ConcurrentQueue
+
+	// spendHintCache is a cache used to query and update the latest height
+	// hints for an outpoint. Each height hint represents the earliest
+	// height at which the outpoint could have been spent within the chain.
+	spendHintCache chainntnfs.SpendHintCache
+
+	// confirmHintCache is a cache used to query the latest height hints for
+	// a transaction. Each height hint represents the earliest height at
+	// which the transaction could have confirmed within the chain.
+	confirmHintCache chainntnfs.ConfirmHintCache
 
 	wg   sync.WaitGroup
 	quit chan struct{}
@@ -91,17 +92,23 @@ var _ chainntnfs.ChainNotifier = (*BtcdNotifier)(nil)
 // New returns a new BtcdNotifier instance. This function assumes the btcd node
 // detailed in the passed configuration is already running, and willing to
 // accept new websockets clients.
-func New(config *rpcclient.ConnConfig) (*BtcdNotifier, error) {
+func New(config *rpcclient.ConnConfig, chainParams *chaincfg.Params,
+	spendHintCache chainntnfs.SpendHintCache,
+	confirmHintCache chainntnfs.ConfirmHintCache) (*BtcdNotifier, error) {
+
 	notifier := &BtcdNotifier{
+		chainParams: chainParams,
+
 		notificationCancels:  make(chan interface{}),
 		notificationRegistry: make(chan interface{}),
 
 		blockEpochClients: make(map[uint64]*blockEpochRegistration),
 
-		spendNotifications: make(map[wire.OutPoint]map[uint64]*spendNotification),
+		chainUpdates: queue.NewConcurrentQueue(10),
+		txUpdates:    queue.NewConcurrentQueue(10),
 
-		chainUpdates: chainntnfs.NewConcurrentQueue(10),
-		txUpdates:    chainntnfs.NewConcurrentQueue(10),
+		spendHintCache:   spendHintCache,
+		confirmHintCache: confirmHintCache,
 
 		quit: make(chan struct{}),
 	}
@@ -128,35 +135,16 @@ func New(config *rpcclient.ConnConfig) (*BtcdNotifier, error) {
 // Start connects to the running btcd node over websockets, registers for block
 // notifications, and finally launches all related helper goroutines.
 func (b *BtcdNotifier) Start() error {
-	// Already started?
-	if atomic.AddInt32(&b.started, 1) != 1 {
-		return nil
-	}
+	var startErr error
+	b.start.Do(func() {
+		startErr = b.startNotifier()
+	})
+	return startErr
+}
 
-	// Connect to btcd, and register for notifications on connected, and
-	// disconnected blocks.
-	if err := b.chainConn.Connect(20); err != nil {
-		return err
-	}
-	if err := b.chainConn.NotifyBlocks(); err != nil {
-		return err
-	}
-
-	_, currentHeight, err := b.chainConn.GetBestBlock()
-	if err != nil {
-		return err
-	}
-
-	b.txConfNotifier = chainntnfs.NewTxConfNotifier(
-		uint32(currentHeight), reorgSafetyLimit)
-
-	b.chainUpdates.Start()
-	b.txUpdates.Start()
-
-	b.wg.Add(1)
-	go b.notificationDispatcher(currentHeight)
-
-	return nil
+// Started returns true if this instance has been started, and false otherwise.
+func (b *BtcdNotifier) Started() bool {
+	return atomic.LoadInt32(&b.active) != 0
 }
 
 // Stop shutsdown the BtcdNotifier.
@@ -178,15 +166,61 @@ func (b *BtcdNotifier) Stop() error {
 
 	// Notify all pending clients of our shutdown by closing the related
 	// notification channels.
-	for _, spendClients := range b.spendNotifications {
-		for _, spendClient := range spendClients {
-			close(spendClient.spendChan)
-		}
-	}
 	for _, epochClient := range b.blockEpochClients {
+		close(epochClient.cancelChan)
+		epochClient.wg.Wait()
+
 		close(epochClient.epochChan)
 	}
-	b.txConfNotifier.TearDown()
+	b.txNotifier.TearDown()
+
+	return nil
+}
+
+func (b *BtcdNotifier) startNotifier() error {
+	// Start our concurrent queues before starting the chain connection, to
+	// ensure onBlockConnected and onRedeemingTx callbacks won't be
+	// blocked.
+	b.chainUpdates.Start()
+	b.txUpdates.Start()
+
+	// Connect to btcd, and register for notifications on connected, and
+	// disconnected blocks.
+	if err := b.chainConn.Connect(20); err != nil {
+		b.txUpdates.Stop()
+		b.chainUpdates.Stop()
+		return err
+	}
+
+	currentHash, currentHeight, err := b.chainConn.GetBestBlock()
+	if err != nil {
+		b.txUpdates.Stop()
+		b.chainUpdates.Stop()
+		return err
+	}
+
+	b.txNotifier = chainntnfs.NewTxNotifier(
+		uint32(currentHeight), chainntnfs.ReorgSafetyLimit,
+		b.confirmHintCache, b.spendHintCache,
+	)
+
+	b.bestBlock = chainntnfs.BlockEpoch{
+		Height: currentHeight,
+		Hash:   currentHash,
+	}
+
+	if err := b.chainConn.NotifyBlocks(); err != nil {
+		b.txUpdates.Stop()
+		b.chainUpdates.Stop()
+		return err
+	}
+
+	b.wg.Add(1)
+	go b.notificationDispatcher()
+
+	// Set the active flag now that we've completed the full
+	// startup.
+	atomic.StoreInt32(&b.active, 1)
 
 	return nil
 }
@@ -197,21 +231,46 @@ func (b *BtcdNotifier) Stop() error {
 func (b *BtcdNotifier) onBlockConnected(hash *chainhash.Hash, height int32, t time.Time) {
 	// Append this new chain update to the end of the queue of new chain
 	// updates.
-	b.chainUpdates.ChanIn() <- &chainUpdate{
+	select {
+	case b.chainUpdates.ChanIn() <- &chainUpdate{
 		blockHash:   hash,
 		blockHeight: height,
 		connect:     true,
+	}:
+	case <-b.quit:
+		return
 	}
+}
+
+// filteredBlock represents a new block which has been connected to the main
+// chain. The slice of transactions will only be populated if the block
+// includes a transaction that confirmed one of our watched txids, or spends
+// one of the outputs currently being watched.
+// TODO(halseth): this is currently used for complete blocks. Change to use
+// onFilteredBlockConnected and onFilteredBlockDisconnected, making it easier
+// to unify with the Neutrino implementation.
+type filteredBlock struct {
+	hash   chainhash.Hash
+	height uint32
+	txns   []*btcutil.Tx
+
+	// connected is true if this update is a new block and false if it is a
+	// disconnected block.
+	connect bool
 }
 
 // onBlockDisconnected implements on OnBlockDisconnected callback for rpcclient.
 func (b *BtcdNotifier) onBlockDisconnected(hash *chainhash.Hash, height int32, t time.Time) {
 	// Append this new chain update to the end of the queue of new chain
 	// updates.
-	b.chainUpdates.ChanIn() <- &chainUpdate{
+	select {
+	case b.chainUpdates.ChanIn() <- &chainUpdate{
 		blockHash:   hash,
 		blockHeight: height,
 		connect:     false,
+	}:
+	case <-b.quit:
+		return
 	}
 }
 
@@ -219,35 +278,32 @@ func (b *BtcdNotifier) onBlockDisconnected(hash *chainhash.Hash, height int32, t
 func (b *BtcdNotifier) onRedeemingTx(tx *btcutil.Tx, details *btcjson.BlockDetails) {
 	// Append this new transaction update to the end of the queue of new
 	// chain updates.
-	b.txUpdates.ChanIn() <- &txUpdate{tx, details}
+	select {
+	case b.txUpdates.ChanIn() <- &txUpdate{tx, details}:
+	case <-b.quit:
+		return
+	}
 }
 
 // notificationDispatcher is the primary goroutine which handles client
 // notification registrations, as well as notification dispatches.
-func (b *BtcdNotifier) notificationDispatcher(currentHeight int32) {
+func (b *BtcdNotifier) notificationDispatcher() {
 out:
 	for {
 		select {
 		case cancelMsg := <-b.notificationCancels:
 			switch msg := cancelMsg.(type) {
-			case *spendCancel:
-				chainntnfs.Log.Infof("Cancelling spend "+
-					"notification for out_point=%v, "+
-					"spend_id=%v", msg.op, msg.spendID)
-
-				// Before we attempt to close the spendChan,
-				// ensure that the notification hasn't already
-				// yet been dispatched.
-				if outPointClients, ok := b.spendNotifications[msg.op]; ok {
-					close(outPointClients[msg.spendID].spendChan)
-					delete(b.spendNotifications[msg.op], msg.spendID)
-				}
-
 			case *epochCancel:
 				chainntnfs.Log.Infof("Cancelling epoch "+
 					"notification, epoch_id=%v", msg.epochID)
 
-				// First, close the cancel channel for this
+				// First, we'll lookup the original
+				// registration in order to stop the active
+				// queue goroutine.
+				reg := b.blockEpochClients[msg.epochID]
+				reg.epochQueue.Stop()
+
+				// Next, close the cancel channel for this
 				// specific client, and wait for the client to
 				// exit.
 				close(b.blockEpochClients[msg.epochID].cancelChan)
@@ -257,135 +313,174 @@ out:
 				// safely close the channel used to send epoch
 				// notifications, in order to notify any
 				// listeners that the intent has been
-				// cancelled.
+				// canceled.
 				close(b.blockEpochClients[msg.epochID].epochChan)
 				delete(b.blockEpochClients, msg.epochID)
-
 			}
 		case registerMsg := <-b.notificationRegistry:
 			switch msg := registerMsg.(type) {
-			case *spendNotification:
-				chainntnfs.Log.Infof("New spend subscription: "+
-					"utxo=%v", msg.targetOutpoint)
-				op := *msg.targetOutpoint
+			case *chainntnfs.HistoricalConfDispatch:
+				// Look up whether the transaction/output script
+				// has already confirmed in the active chain.
+				// We'll do this in a goroutine to prevent
+				// blocking potentially long rescans.
+				//
+				// TODO(wilmer): add retry logic if rescan fails?
+				b.wg.Add(1)
+				go func() {
+					defer b.wg.Done()
 
-				if _, ok := b.spendNotifications[op]; !ok {
-					b.spendNotifications[op] = make(map[uint64]*spendNotification)
-				}
-				b.spendNotifications[op][msg.spendID] = msg
-			case *confirmationsNotification:
-				chainntnfs.Log.Infof("New confirmations "+
-					"subscription: txid=%v, numconfs=%v",
-					msg.TxID, msg.NumConfirmations)
+					confDetails, _, err := b.historicalConfDetails(
+						msg.ConfRequest,
+						msg.StartHeight, msg.EndHeight,
+					)
+					if err != nil {
+						chainntnfs.Log.Error(err)
+						return
+					}
 
-				// Lookup whether the transaction is already included in the
-				// active chain.
-				txConf, err := b.historicalConfDetails(msg.TxID)
-				if err != nil {
-					chainntnfs.Log.Error(err)
-				}
-				err = b.txConfNotifier.Register(&msg.ConfNtfn, txConf)
-				if err != nil {
-					chainntnfs.Log.Error(err)
-				}
+					// If the historical dispatch finished
+					// without error, we will invoke
+					// UpdateConfDetails even if none were
+					// found. This allows the notifier to
+					// begin safely updating the height hint
+					// cache at tip, since any pending
+					// rescans have now completed.
+					err = b.txNotifier.UpdateConfDetails(
+						msg.ConfRequest, confDetails,
+					)
+					if err != nil {
+						chainntnfs.Log.Error(err)
+					}
+				}()
+
 			case *blockEpochRegistration:
 				chainntnfs.Log.Infof("New block epoch subscription")
+
 				b.blockEpochClients[msg.epochID] = msg
+
+				// If the client did not provide their best
+				// known block, then we'll immediately dispatch
+				// a notification for the current tip.
+				if msg.bestBlock == nil {
+					b.notifyBlockEpochClient(
+						msg, b.bestBlock.Height,
+						b.bestBlock.Hash,
+					)
+
+					msg.errorChan <- nil
+					continue
+				}
+
+				// Otherwise, we'll attempt to deliver the
+				// backlog of notifications from their best
+				// known block.
+				missedBlocks, err := chainntnfs.GetClientMissedBlocks(
+					b.chainConn, msg.bestBlock,
+					b.bestBlock.Height, true,
+				)
+				if err != nil {
+					msg.errorChan <- err
+					continue
+				}
+
+				for _, block := range missedBlocks {
+					b.notifyBlockEpochClient(
+						msg, block.Height, block.Hash,
+					)
+				}
+
+				msg.errorChan <- nil
 			}
 
 		case item := <-b.chainUpdates.ChanOut():
 			update := item.(*chainUpdate)
 			if update.connect {
-				if update.blockHeight != currentHeight+1 {
-					chainntnfs.Log.Warnf("Received blocks out of order: "+
-						"current height=%d, new height=%d",
-						currentHeight, update.blockHeight)
+				blockHeader, err :=
+					b.chainConn.GetBlockHeader(update.blockHash)
+				if err != nil {
+					chainntnfs.Log.Errorf("Unable to fetch "+
+						"block header: %v", err)
 					continue
 				}
 
-				currentHeight = update.blockHeight
+				if blockHeader.PrevBlock != *b.bestBlock.Hash {
+					// Handle the case where the notifier
+					// missed some blocks from its chain
+					// backend
+					chainntnfs.Log.Infof("Missed blocks, " +
+						"attempting to catch up")
+					newBestBlock, missedBlocks, err :=
+						chainntnfs.HandleMissedBlocks(
+							b.chainConn,
+							b.txNotifier,
+							b.bestBlock,
+							update.blockHeight,
+							true,
+						)
+					if err != nil {
+						// Set the bestBlock here in case
+						// a catch up partially completed.
+						b.bestBlock = newBestBlock
+						chainntnfs.Log.Error(err)
+						continue
+					}
 
-				rawBlock, err := b.chainConn.GetBlock(update.blockHash)
-				if err != nil {
-					chainntnfs.Log.Errorf("Unable to get block: %v", err)
-					continue
+					for _, block := range missedBlocks {
+						err := b.handleBlockConnected(block)
+						if err != nil {
+							chainntnfs.Log.Error(err)
+							continue out
+						}
+					}
 				}
 
-				chainntnfs.Log.Infof("New block: height=%v, sha=%v",
-					update.blockHeight, update.blockHash)
-
-				b.notifyBlockEpochs(update.blockHeight, update.blockHash)
-
-				txns := btcutil.NewBlock(rawBlock).Transactions()
-				err = b.txConfNotifier.ConnectTip(update.blockHash,
-					uint32(update.blockHeight), txns)
-				if err != nil {
+				newBlock := chainntnfs.BlockEpoch{
+					Height: update.blockHeight,
+					Hash:   update.blockHash,
+				}
+				if err := b.handleBlockConnected(newBlock); err != nil {
 					chainntnfs.Log.Error(err)
 				}
 				continue
 			}
 
-			if update.blockHeight != currentHeight {
-				chainntnfs.Log.Warnf("Received blocks out of order: "+
-					"current height=%d, disconnected height=%d",
-					currentHeight, update.blockHeight)
-				continue
+			if update.blockHeight != b.bestBlock.Height {
+				chainntnfs.Log.Infof("Missed disconnected" +
+					"blocks, attempting to catch up")
 			}
 
-			currentHeight = update.blockHeight - 1
-
-			chainntnfs.Log.Infof("Block disconnected from main chain: "+
-				"height=%v, sha=%v", update.blockHeight, update.blockHash)
-
-			err := b.txConfNotifier.DisconnectTip(uint32(update.blockHeight))
+			newBestBlock, err := chainntnfs.RewindChain(
+				b.chainConn, b.txNotifier, b.bestBlock,
+				update.blockHeight-1,
+			)
 			if err != nil {
-				chainntnfs.Log.Error(err)
+				chainntnfs.Log.Errorf("Unable to rewind chain "+
+					"from height %d to height %d: %v",
+					b.bestBlock.Height, update.blockHeight-1, err)
 			}
+
+			// Set the bestBlock here in case a chain rewind
+			// partially completed.
+			b.bestBlock = newBestBlock
 
 		case item := <-b.txUpdates.ChanOut():
 			newSpend := item.(*txUpdate)
-			spendingTx := newSpend.tx
 
-			// First, check if this transaction spends an output
-			// that has an existing spend notification for it.
-			for i, txIn := range spendingTx.MsgTx().TxIn {
-				prevOut := txIn.PreviousOutPoint
+			// We only care about notifying on confirmed spends, so
+			// if this is a mempool spend, we can ignore it and wait
+			// for the spend to appear in on-chain.
+			if newSpend.details == nil {
+				continue
+			}
 
-				// If this transaction indeed does spend an
-				// output which we have a registered
-				// notification for, then create a spend
-				// summary, finally sending off the details to
-				// the notification subscriber.
-				if clients, ok := b.spendNotifications[prevOut]; ok {
-					spenderSha := newSpend.tx.Hash()
-					spendDetails := &chainntnfs.SpendDetail{
-						SpentOutPoint:     &prevOut,
-						SpenderTxHash:     spenderSha,
-						SpendingTx:        spendingTx.MsgTx(),
-						SpenderInputIndex: uint32(i),
-					}
-					// TODO(roasbeef): after change to
-					// loadfilter, only notify on block
-					// inclusion?
-					if newSpend.details != nil {
-						spendDetails.SpendingHeight = newSpend.details.Height
-					} else {
-						spendDetails.SpendingHeight = currentHeight + 1
-					}
-
-					for _, ntfn := range clients {
-						chainntnfs.Log.Infof("Dispatching "+
-							"spend notification for "+
-							"outpoint=%v", ntfn.targetOutpoint)
-						ntfn.spendChan <- spendDetails
-
-						// Close spendChan to ensure that any calls to Cancel will not
-						// block. This is safe to do since the channel is buffered, and the
-						// message can still be read by the receiver.
-						close(ntfn.spendChan)
-					}
-					delete(b.spendNotifications, prevOut)
-				}
+			err := b.txNotifier.ProcessRelevantSpendTx(
+				newSpend.tx, uint32(newSpend.details.Height),
+			)
+			if err != nil {
+				chainntnfs.Log.Errorf("Unable to process "+
+					"transaction %v: %v",
+					newSpend.tx.Hash(), err)
 			}
 
 		case <-b.quit:
@@ -395,227 +490,412 @@ out:
 	b.wg.Done()
 }
 
-// historicalConfDetails looks up whether a transaction is already included in a
-// block in the active chain and, if so, returns details about the confirmation.
-func (b *BtcdNotifier) historicalConfDetails(txid *chainhash.Hash,
-) (*chainntnfs.TxConfirmation, error) {
+// historicalConfDetails looks up whether a confirmation request (txid/output
+// script) has already been included in a block in the active chain and, if so,
+// returns details about said block.
+func (b *BtcdNotifier) historicalConfDetails(confRequest chainntnfs.ConfRequest,
+	startHeight, endHeight uint32) (*chainntnfs.TxConfirmation,
+	chainntnfs.TxConfStatus, error) {
 
-	// If the transaction already has some or all of the confirmations,
-	// then we may be able to dispatch it immediately.
-	tx, err := b.chainConn.GetRawTransactionVerbose(txid)
-	if err != nil || tx == nil || tx.BlockHash == "" {
-		if err == nil {
-			return nil, nil
+	// If a txid was not provided, then we should dispatch upon seeing the
+	// script on-chain, so we'll short-circuit straight to scanning manually
+	// as there doesn't exist a script index to query.
+	if confRequest.TxID == chainntnfs.ZeroHash {
+		return b.confDetailsManually(
+			confRequest, startHeight, endHeight,
+		)
+	}
+
+	// Otherwise, we'll dispatch upon seeing a transaction on-chain with the
+	// given hash.
+	//
+	// We'll first attempt to retrieve the transaction using the node's
+	// txindex.
+	txNotFoundErr := "No information available about transaction"
+	txConf, txStatus, err := chainntnfs.ConfDetailsFromTxIndex(
+		b.chainConn, confRequest, txNotFoundErr,
+	)
+
+	// We'll then check the status of the transaction lookup returned to
+	// determine whether we should proceed with any fallback methods.
+	switch {
+
+	// We failed querying the index for the transaction, fall back to
+	// scanning manually.
+	case err != nil:
+		chainntnfs.Log.Debugf("Unable to determine confirmation of %v "+
+			"through the backend's txindex (%v), scanning manually",
+			confRequest.TxID, err)
+
+		return b.confDetailsManually(
+			confRequest, startHeight, endHeight,
+		)
+
+	// The transaction was found within the node's mempool.
+	case txStatus == chainntnfs.TxFoundMempool:
+
+	// The transaction was found within the node's txindex.
+	case txStatus == chainntnfs.TxFoundIndex:
+
+	// The transaction was not found within the node's mempool or txindex.
+	case txStatus == chainntnfs.TxNotFoundIndex:
+
+	// Unexpected txStatus returned.
+	default:
+		return nil, txStatus,
+			fmt.Errorf("Got unexpected txConfStatus: %v", txStatus)
+	}
+
+	return txConf, txStatus, nil
+}
+
+// confDetailsManually looks up whether a transaction/output script has already
+// been included in a block in the active chain by scanning the chain's blocks
+// within the given range. If the transaction/output script is found, its
+// confirmation details are returned. Otherwise, nil is returned.
+func (b *BtcdNotifier) confDetailsManually(confRequest chainntnfs.ConfRequest,
+	startHeight, endHeight uint32) (*chainntnfs.TxConfirmation,
+	chainntnfs.TxConfStatus, error) {
+
+	// Begin scanning blocks at every height to determine where the
+	// transaction was included in.
+	for height := endHeight; height >= startHeight && height > 0; height-- {
+		// Ensure we haven't been requested to shut down before
+		// processing the next height.
+		select {
+		case <-b.quit:
+			return nil, chainntnfs.TxNotFoundManually,
+				chainntnfs.ErrChainNotifierShuttingDown
+		default:
 		}
-		// Do not return an error if the transaction was not found.
-		if jsonErr, ok := err.(*btcjson.RPCError); ok {
-			if jsonErr.Code == btcjson.ErrRPCNoTxInfo {
-				return nil, nil
+
+		blockHash, err := b.chainConn.GetBlockHash(int64(height))
+		if err != nil {
+			return nil, chainntnfs.TxNotFoundManually,
+				fmt.Errorf("unable to get hash from block "+
+					"with height %d", height)
+		}
+
+		// TODO: fetch the neutrino filters instead.
+		block, err := b.chainConn.GetBlock(blockHash)
+		if err != nil {
+			return nil, chainntnfs.TxNotFoundManually,
+				fmt.Errorf("unable to get block with hash "+
+					"%v: %v", blockHash, err)
+		}
+
+		// For every transaction in the block, check which one matches
+		// our request. If we find one that does, we can dispatch its
+		// confirmation details.
+		for txIndex, tx := range block.Transactions {
+			if !confRequest.MatchesTx(tx) {
+				continue
 			}
-		}
-		return nil, fmt.Errorf("unable to query for txid(%v): %v", txid, err)
-	}
 
-	// As we need to fully populate the returned TxConfirmation struct,
-	// grab the block in which the transaction was confirmed so we can
-	// locate its exact index within the block.
-	blockHash, err := chainhash.NewHashFromStr(tx.BlockHash)
-	if err != nil {
-		return nil, fmt.Errorf("unable to get block hash %v for historical "+
-			"dispatch: %v", tx.BlockHash, err)
-	}
-	block, err := b.chainConn.GetBlockVerbose(blockHash)
-	if err != nil {
-		return nil, fmt.Errorf("unable to get block hash: %v", err)
-	}
-
-	// If the block obtained, locate the transaction's index within the
-	// block so we can give the subscriber full confirmation details.
-	txIndex := -1
-	targetTxidStr := txid.String()
-	for i, txHash := range block.Tx {
-		if txHash == targetTxidStr {
-			txIndex = i
-			break
+			return &chainntnfs.TxConfirmation{
+				Tx:          tx,
+				BlockHash:   blockHash,
+				BlockHeight: height,
+				TxIndex:     uint32(txIndex),
+			}, chainntnfs.TxFoundManually, nil
 		}
 	}
 
-	if txIndex == -1 {
-		return nil, fmt.Errorf("unable to locate tx %v in block %v",
-			txid, blockHash)
+	// If we reach here, then we were not able to find the transaction
+	// within a block, so we avoid returning an error.
+	return nil, chainntnfs.TxNotFoundManually, nil
+}
+
+// handleBlockConnected applies a chain update for a new block. Any watched
+// transactions included this block will processed to either send notifications
+// now or after numConfirmations confs.
+// TODO(halseth): this is reusing the neutrino notifier implementation, unify
+// them.
+func (b *BtcdNotifier) handleBlockConnected(epoch chainntnfs.BlockEpoch) error {
+	// First, we'll fetch the raw block as we'll need to gather all the
+	// transactions to determine whether any are relevant to our registered
+	// clients.
+	rawBlock, err := b.chainConn.GetBlock(epoch.Hash)
+	if err != nil {
+		return fmt.Errorf("unable to get block: %v", err)
+	}
+	newBlock := &filteredBlock{
+		hash:    *epoch.Hash,
+		height:  uint32(epoch.Height),
+		txns:    btcutil.NewBlock(rawBlock).Transactions(),
+		connect: true,
 	}
 
-	txConf := chainntnfs.TxConfirmation{
-		BlockHash:   blockHash,
-		BlockHeight: uint32(block.Height),
-		TxIndex:     uint32(txIndex),
+	// We'll then extend the txNotifier's height with the information of
+	// this new block, which will handle all of the notification logic for
+	// us.
+	err = b.txNotifier.ConnectTip(
+		&newBlock.hash, newBlock.height, newBlock.txns,
+	)
+	if err != nil {
+		return fmt.Errorf("unable to connect tip: %v", err)
 	}
-	return &txConf, nil
+
+	chainntnfs.Log.Infof("New block: height=%v, sha=%v", epoch.Height,
+		epoch.Hash)
+
+	// Now that we've guaranteed the new block extends the txNotifier's
+	// current tip, we'll proceed to dispatch notifications to all of our
+	// registered clients whom have had notifications fulfilled. Before
+	// doing so, we'll make sure update our in memory state in order to
+	// satisfy any client requests based upon the new block.
+	b.bestBlock = epoch
+
+	b.notifyBlockEpochs(epoch.Height, epoch.Hash)
+	return b.txNotifier.NotifyHeight(uint32(epoch.Height))
 }
 
 // notifyBlockEpochs notifies all registered block epoch clients of the newly
 // connected block to the main chain.
 func (b *BtcdNotifier) notifyBlockEpochs(newHeight int32, newSha *chainhash.Hash) {
+	for _, client := range b.blockEpochClients {
+		b.notifyBlockEpochClient(client, newHeight, newSha)
+	}
+}
+
+// notifyBlockEpochClient sends a registered block epoch client a notification
+// about a specific block.
+func (b *BtcdNotifier) notifyBlockEpochClient(epochClient *blockEpochRegistration,
+	height int32, sha *chainhash.Hash) {
+
 	epoch := &chainntnfs.BlockEpoch{
-		Height: newHeight,
-		Hash:   newSha,
-	}
-
-	for _, epochClient := range b.blockEpochClients {
-		b.wg.Add(1)
-		epochClient.wg.Add(1)
-		go func(ntfnChan chan *chainntnfs.BlockEpoch, cancelChan chan struct{},
-			clientWg *sync.WaitGroup) {
-
-			// TODO(roasbeef): move to goroutine per client, use sync queue
-
-			defer clientWg.Done()
-			defer b.wg.Done()
-
-			select {
-			case ntfnChan <- epoch:
-
-			case <-cancelChan:
-				return
-
-			case <-b.quit:
-				return
-			}
-
-		}(epochClient.epochChan, epochClient.cancelChan, &epochClient.wg)
-	}
-}
-
-// spendNotification couples a target outpoint along with the channel used for
-// notifications once a spend of the outpoint has been detected.
-type spendNotification struct {
-	targetOutpoint *wire.OutPoint
-
-	spendChan chan *chainntnfs.SpendDetail
-
-	spendID uint64
-}
-
-// spendCancel is a message sent to the BtcdNotifier when a client wishes to
-// cancel an outstanding spend notification that has yet to be dispatched.
-type spendCancel struct {
-	// op is the target outpoint of the notification to be cancelled.
-	op wire.OutPoint
-
-	// spendID the ID of the notification to cancel.
-	spendID uint64
-}
-
-// RegisterSpendNtfn registers an intent to be notified once the target
-// outpoint has been spent by a transaction on-chain. Once a spend of the target
-// outpoint has been detected, the details of the spending event will be sent
-// across the 'Spend' channel.
-func (b *BtcdNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
-	_ uint32) (*chainntnfs.SpendEvent, error) {
-
-	if err := b.chainConn.NotifySpent([]*wire.OutPoint{outpoint}); err != nil {
-		return nil, err
-	}
-
-	ntfn := &spendNotification{
-		targetOutpoint: outpoint,
-		spendChan:      make(chan *chainntnfs.SpendDetail, 1),
-		spendID:        atomic.AddUint64(&b.spendClientCounter, 1),
+		Height: height,
+		Hash:   sha,
 	}
 
 	select {
+	case epochClient.epochQueue.ChanIn() <- epoch:
+	case <-epochClient.cancelChan:
 	case <-b.quit:
-		return nil, ErrChainNotifierShuttingDown
-	case b.notificationRegistry <- ntfn:
 	}
+}
 
-	// The following conditional checks to ensure that when a spend notification
-	// is registered, the output hasn't already been spent. If the output
-	// is no longer in the UTXO set, the chain will be rescanned from the point
-	// where the output was added. The rescan will dispatch the notification.
-	txout, err := b.chainConn.GetTxOut(&outpoint.Hash, outpoint.Index, true)
+// RegisterSpendNtfn registers an intent to be notified once the target
+// outpoint/output script has been spent by a transaction on-chain. When
+// intending to be notified of the spend of an output script, a nil outpoint
+// must be used. The heightHint should represent the earliest height in the
+// chain of the transaction that spent the outpoint/output script.
+//
+// Once a spend of has been detected, the details of the spending event will be
+// sent across the 'Spend' channel.
+func (b *BtcdNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
+	pkScript []byte, heightHint uint32) (*chainntnfs.SpendEvent, error) {
+
+	// Register the conf notification with the TxNotifier. A non-nil value
+	// for `dispatch` will be returned if we are required to perform a
+	// manual scan for the confirmation. Otherwise the notifier will begin
+	// watching at tip for the transaction to confirm.
+	ntfn, err := b.txNotifier.RegisterSpend(outpoint, pkScript, heightHint)
 	if err != nil {
 		return nil, err
 	}
 
-	if txout == nil {
-		transaction, err := b.chainConn.GetRawTransactionVerbose(&outpoint.Hash)
+	// We'll then request the backend to notify us when it has detected the
+	// outpoint/output script as spent.
+	//
+	// TODO(wilmer): use LoadFilter API instead.
+	if outpoint == nil || *outpoint == chainntnfs.ZeroOutPoint {
+		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
+			pkScript, b.chainParams,
+		)
 		if err != nil {
-			jsonErr, ok := err.(*btcjson.RPCError)
-			if !ok || jsonErr.Code != btcjson.ErrRPCNoTxInfo {
-				return nil, err
-			}
+			return nil, fmt.Errorf("unable to parse script: %v", err)
+		}
+		if err := b.chainConn.NotifyReceived(addrs); err != nil {
+			return nil, err
+		}
+	} else {
+		ops := []*wire.OutPoint{outpoint}
+		if err := b.chainConn.NotifySpent(ops); err != nil {
+			return nil, err
+		}
+	}
+
+	// If the txNotifier didn't return any details to perform a historical
+	// scan of the chain, then we can return early as there's nothing left
+	// for us to do.
+	if ntfn.HistoricalDispatch == nil {
+		return ntfn.Event, nil
+	}
+
+	// Otherwise, we'll need to dispatch a historical rescan to determine if
+	// the outpoint was already spent at a previous height.
+	//
+	// We'll short-circuit the path when dispatching the spend of a script,
+	// rather than an outpoint, as there aren't any additional checks we can
+	// make for scripts.
+	if outpoint == nil || *outpoint == chainntnfs.ZeroOutPoint {
+		startHash, err := b.chainConn.GetBlockHash(
+			int64(ntfn.HistoricalDispatch.StartHeight),
+		)
+		if err != nil {
+			return nil, err
 		}
 
-		if transaction != nil {
-			blockhash, err := chainhash.NewHashFromStr(transaction.BlockHash)
-			if err != nil {
-				return nil, err
-			}
+		// TODO(wilmer): add retry logic if rescan fails?
+		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
+			pkScript, b.chainParams,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse address: %v", err)
+		}
 
-			ops := []*wire.OutPoint{outpoint}
-			if err := b.chainConn.Rescan(blockhash, nil, ops); err != nil {
-				chainntnfs.Log.Errorf("Rescan for spend "+
-					"notification txout failed: %v", err)
-				return nil, err
+		asyncResult := b.chainConn.RescanAsync(startHash, addrs, nil)
+		go func() {
+			if rescanErr := asyncResult.Receive(); rescanErr != nil {
+				chainntnfs.Log.Errorf("Rescan to determine "+
+					"the spend details of %v failed: %v",
+					ntfn.HistoricalDispatch.SpendRequest,
+					rescanErr)
+			}
+		}()
+
+		return ntfn.Event, nil
+	}
+
+	// When dispatching spends of outpoints, there are a number of checks we
+	// can make to start our rescan from a better height or completely avoid
+	// it.
+	//
+	// We'll start by checking the backend's UTXO set to determine whether
+	// the outpoint has been spent. If it hasn't, we can return to the
+	// caller as well.
+	txOut, err := b.chainConn.GetTxOut(&outpoint.Hash, outpoint.Index, true)
+	if err != nil {
+		return nil, err
+	}
+	if txOut != nil {
+		// We'll let the txNotifier know the outpoint is still unspent
+		// in order to begin updating its spend hint.
+		err := b.txNotifier.UpdateSpendDetails(
+			ntfn.HistoricalDispatch.SpendRequest, nil,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		return ntfn.Event, nil
+	}
+
+	// Since the outpoint was spent, as it no longer exists within the UTXO
+	// set, we'll determine when it happened by scanning the chain. We'll
+	// begin by fetching the block hash of our starting height.
+	startHash, err := b.chainConn.GetBlockHash(
+		int64(ntfn.HistoricalDispatch.StartHeight),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to get block hash for height "+
+			"%d: %v", ntfn.HistoricalDispatch.StartHeight, err)
+	}
+
+	// As a minimal optimization, we'll query the backend's transaction
+	// index (if enabled) to determine if we have a better rescan starting
+	// height. We can do this as the GetRawTransaction call will return the
+	// hash of the block it was included in within the chain.
+	tx, err := b.chainConn.GetRawTransactionVerbose(&outpoint.Hash)
+	if err != nil {
+		// Avoid returning an error if the transaction was not found to
+		// proceed with fallback methods.
+		jsonErr, ok := err.(*btcjson.RPCError)
+		if !ok || jsonErr.Code != btcjson.ErrRPCNoTxInfo {
+			return nil, fmt.Errorf("unable to query for txid %v: %v",
+				outpoint.Hash, err)
+		}
+	}
+
+	// If the transaction index was enabled, we'll use the block's hash to
+	// retrieve its height and check whether it provides a better starting
+	// point for our rescan.
+	if tx != nil {
+		// If the transaction containing the outpoint hasn't confirmed
+		// on-chain, then there's no need to perform a rescan.
+		if tx.BlockHash == "" {
+			return ntfn.Event, nil
+		}
+
+		blockHash, err := chainhash.NewHashFromStr(tx.BlockHash)
+		if err != nil {
+			return nil, err
+		}
+		blockHeader, err := b.chainConn.GetBlockHeaderVerbose(blockHash)
+		if err != nil {
+			return nil, fmt.Errorf("unable to get header for "+
+				"block %v: %v", blockHash, err)
+		}
+
+		if uint32(blockHeader.Height) > ntfn.HistoricalDispatch.StartHeight {
+			startHash, err = b.chainConn.GetBlockHash(
+				int64(blockHeader.Height),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("unable to get block "+
+					"hash for height %d: %v",
+					blockHeader.Height, err)
 			}
 		}
 	}
 
-	return &chainntnfs.SpendEvent{
-		Spend: ntfn.spendChan,
-		Cancel: func() {
-			cancel := &spendCancel{
-				op:      *outpoint,
-				spendID: ntfn.spendID,
-			}
+	// Now that we've determined the best starting point for our rescan,
+	// we can go ahead and dispatch it.
+	//
+	// In order to ensure that we don't block the caller on what may be a
+	// long rescan, we'll launch a new goroutine to handle the async result
+	// of the rescan. We purposefully prevent from adding this goroutine to
+	// the WaitGroup as we cannot wait for a quit signal due to the
+	// asyncResult channel not being exposed.
+	//
+	// TODO(wilmer): add retry logic if rescan fails?
+	asyncResult := b.chainConn.RescanAsync(
+		startHash, nil, []*wire.OutPoint{outpoint},
+	)
+	go func() {
+		if rescanErr := asyncResult.Receive(); rescanErr != nil {
+			chainntnfs.Log.Errorf("Rescan to determine the spend "+
+				"details of %v failed: %v", outpoint, rescanErr)
+		}
+	}()
 
-			// Submit spend cancellation to notification dispatcher.
-			select {
-			case b.notificationCancels <- cancel:
-				// Cancellation is being handled, drain the spend chan until it is
-				// closed before yielding to the caller.
-				for {
-					select {
-					case _, ok := <-ntfn.spendChan:
-						if !ok {
-							return
-						}
-					case <-b.quit:
-						return
-					}
-				}
-			case <-b.quit:
-			}
-		},
-	}, nil
+	return ntfn.Event, nil
 }
 
-// confirmationNotification represents a client's intent to receive a
-// notification once the target txid reaches numConfirmations confirmations.
-type confirmationsNotification struct {
-	chainntnfs.ConfNtfn
-}
-
-// RegisterConfirmationsNtfn registers a notification with BtcdNotifier
-// which will be triggered once the txid reaches numConfs number of
-// confirmations.
+// RegisterConfirmationsNtfn registers an intent to be notified once the target
+// txid/output script has reached numConfs confirmations on-chain. When
+// intending to be notified of the confirmation of an output script, a nil txid
+// must be used. The heightHint should represent the earliest height at which
+// the txid/output script could have been included in the chain.
+//
+// Progress on the number of confirmations left can be read from the 'Updates'
+// channel. Once it has reached all of its confirmations, a notification will be
+// sent across the 'Confirmed' channel.
 func (b *BtcdNotifier) RegisterConfirmationsNtfn(txid *chainhash.Hash,
-	numConfs, _ uint32) (*chainntnfs.ConfirmationEvent, error) {
+	pkScript []byte,
+	numConfs, heightHint uint32) (*chainntnfs.ConfirmationEvent, error) {
 
-	ntfn := &confirmationsNotification{
-		chainntnfs.ConfNtfn{
-			TxID:             txid,
-			NumConfirmations: numConfs,
-			Event:            chainntnfs.NewConfirmationEvent(),
-		},
+	// Register the conf notification with the TxNotifier. A non-nil value
+	// for `dispatch` will be returned if we are required to perform a
+	// manual scan for the confirmation. Otherwise the notifier will begin
+	// watching at tip for the transaction to confirm.
+	ntfn, err := b.txNotifier.RegisterConf(
+		txid, pkScript, numConfs, heightHint,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if ntfn.HistoricalDispatch == nil {
+		return ntfn.Event, nil
 	}
 
 	select {
-	case <-b.quit:
-		return nil, ErrChainNotifierShuttingDown
-	case b.notificationRegistry <- ntfn:
+	case b.notificationRegistry <- ntfn.HistoricalDispatch:
 		return ntfn.Event, nil
+	case <-b.quit:
+		return nil, chainntnfs.ErrChainNotifierShuttingDown
 	}
 }
 
@@ -625,6 +905,12 @@ type blockEpochRegistration struct {
 	epochID uint64
 
 	epochChan chan *chainntnfs.BlockEpoch
+
+	epochQueue *queue.ConcurrentQueue
+
+	bestBlock *chainntnfs.BlockEpoch
+
+	errorChan chan error
 
 	cancelChan chan struct{}
 
@@ -639,34 +925,79 @@ type epochCancel struct {
 
 // RegisterBlockEpochNtfn returns a BlockEpochEvent which subscribes the
 // caller to receive notifications, of each new block connected to the main
-// chain.
-func (b *BtcdNotifier) RegisterBlockEpochNtfn() (*chainntnfs.BlockEpochEvent, error) {
-	registration := &blockEpochRegistration{
+// chain. Clients have the option of passing in their best known block, which
+// the notifier uses to check if they are behind on blocks and catch them up. If
+// they do not provide one, then a notification will be dispatched immediately
+// for the current tip of the chain upon a successful registration.
+func (b *BtcdNotifier) RegisterBlockEpochNtfn(
+	bestBlock *chainntnfs.BlockEpoch) (*chainntnfs.BlockEpochEvent, error) {
+
+	reg := &blockEpochRegistration{
+		epochQueue: queue.NewConcurrentQueue(20),
 		epochChan:  make(chan *chainntnfs.BlockEpoch, 20),
 		cancelChan: make(chan struct{}),
 		epochID:    atomic.AddUint64(&b.epochClientCounter, 1),
+		bestBlock:  bestBlock,
+		errorChan:  make(chan error, 1),
 	}
+
+	reg.epochQueue.Start()
+
+	// Before we send the request to the main goroutine, we'll launch a new
+	// goroutine to proxy items added to our queue to the client itself.
+	// This ensures that all notifications are received *in order*.
+	reg.wg.Add(1)
+	go func() {
+		defer reg.wg.Done()
+
+		for {
+			select {
+			case ntfn := <-reg.epochQueue.ChanOut():
+				blockNtfn := ntfn.(*chainntnfs.BlockEpoch)
+				select {
+				case reg.epochChan <- blockNtfn:
+
+				case <-reg.cancelChan:
+					return
+
+				case <-b.quit:
+					return
+				}
+
+			case <-reg.cancelChan:
+				return
+
+			case <-b.quit:
+				return
+			}
+		}
+	}()
 
 	select {
 	case <-b.quit:
+		// As we're exiting before the registration could be sent,
+		// we'll stop the queue now ourselves.
+		reg.epochQueue.Stop()
+
 		return nil, errors.New("chainntnfs: system interrupt while " +
 			"attempting to register for block epoch notification.")
-	case b.notificationRegistry <- registration:
+	case b.notificationRegistry <- reg:
 		return &chainntnfs.BlockEpochEvent{
-			Epochs: registration.epochChan,
+			Epochs: reg.epochChan,
 			Cancel: func() {
 				cancel := &epochCancel{
-					epochID: registration.epochID,
+					epochID: reg.epochID,
 				}
 
 				// Submit epoch cancellation to notification dispatcher.
 				select {
 				case b.notificationCancels <- cancel:
-					// Cancellation is being handled, drain the epoch channel until it is
-					// closed before yielding to caller.
+					// Cancellation is being handled, drain
+					// the epoch channel until it is closed
+					// before yielding to caller.
 					for {
 						select {
-						case _, ok := <-registration.epochChan:
+						case _, ok := <-reg.epochChan:
 							if !ok {
 								return
 							}

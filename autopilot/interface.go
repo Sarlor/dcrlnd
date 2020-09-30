@@ -3,11 +3,16 @@ package autopilot
 import (
 	"net"
 
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
 )
+
+// DefaultConfTarget is the default confirmation target for autopilot channels.
+// TODO(halseth): possibly make dynamic, going aggressive->lax as more channels
+// are opened.
+const DefaultConfTarget = 3
 
 // Node node is an interface which represents n abstract vertex within the
 // channel graph. All nodes should have at least a single edge to/from them
@@ -17,8 +22,8 @@ import (
 type Node interface {
 	// PubKey is the identity public key of the node. This will be used to
 	// attempt to target a node for channel opening by the main autopilot
-	// agent.
-	PubKey() *btcec.PublicKey
+	// agent. The key will be returned in serialized compressed format.
+	PubKey() [33]byte
 
 	// Addrs returns a slice of publicly reachable public TCP addresses
 	// that the peer is known to be listening on.
@@ -81,14 +86,27 @@ type ChannelGraph interface {
 	ForEachNode(func(Node) error) error
 }
 
+// NodeScore is a tuple mapping a NodeID to a score indicating the preference
+// of opening a channel with it.
+type NodeScore struct {
+	// NodeID is the serialized compressed pubkey of the node that is being
+	// scored.
+	NodeID NodeID
+
+	// Score is the score given by the heuristic for opening a channel of
+	// the given size to this node.
+	Score float64
+}
+
 // AttachmentDirective describes a channel attachment proscribed by an
 // AttachmentHeuristic. It details to which node a channel should be created
 // to, and also the parameters which should be used in the channel creation.
 type AttachmentDirective struct {
-	// PeerKey is the target node for this attachment directive. It can be
-	// identified by it's public key, and therefore can be used along with
-	// a ChannelOpener implementation to execute the directive.
-	PeerKey *btcec.PublicKey
+	// NodeID is the serialized compressed pubkey of the target node for
+	// this attachment directive. It can be identified by its public key,
+	// and therefore can be used along with a ChannelOpener implementation
+	// to execute the directive.
+	NodeID NodeID
 
 	// ChanAmt is the size of the channel that should be opened, expressed
 	// in satoshis.
@@ -106,35 +124,94 @@ type AttachmentDirective struct {
 // the interface is to allow an auto-pilot agent to decide if it needs more
 // channels, and if so, which exact channels should be opened.
 type AttachmentHeuristic interface {
-	// NeedMoreChans is a predicate that should return true if, given the
-	// passed parameters, and its internal state, more channels should be
-	// opened within the channel graph. If the heuristic decides that we do
-	// indeed need more channels, then the second argument returned will
-	// represent the amount of additional funds to be used towards creating
-	// channels.
-	//
-	// TODO(roasbeef): return number of chans? ensure doesn't go over
-	NeedMoreChans(chans []Channel, balance btcutil.Amount) (btcutil.Amount, bool)
+	// Name returns the name of this heuristic.
+	Name() string
 
-	// Select is a method that given the current state of the channel
-	// graph, a set of nodes to ignore, and an amount of available funds,
-	// should return a set of attachment directives which describe which
-	// additional channels should be opened within the graph to push the
-	// heuristic back towards its equilibrium state.
-	Select(self *btcec.PublicKey, graph ChannelGraph, amtToUse btcutil.Amount,
-		skipNodes map[NodeID]struct{}) ([]AttachmentDirective, error)
+	// NodeScores is a method that given the current channel graph and
+	// current set of local channels, scores the given nodes according to
+	// the preference of opening a channel of the given size with them. The
+	// returned channel candidates maps the NodeID to a NodeScore for the
+	// node.
+	//
+	// The returned scores will be in the range [0, 1.0], where 0 indicates
+	// no improvement in connectivity if a channel is opened to this node,
+	// while 1.0 is the maximum possible improvement in connectivity. The
+	// implementation of this interface must return scores in this range to
+	// properly allow the autopilot agent to make a reasonable choice based
+	// on the score from multiple heuristics.
+	//
+	// NOTE: A NodeID not found in the returned map is implicitly given a
+	// score of 0.
+	NodeScores(g ChannelGraph, chans []Channel,
+		chanSize btcutil.Amount, nodes map[NodeID]struct{}) (
+		map[NodeID]*NodeScore, error)
+}
+
+// NodeMetric is a common interface for all graph metrics that are not
+// directly used as autopilot node scores but may be used in compositional
+// heuristics or statistical information exposed to users.
+type NodeMetric interface {
+	// Name returns the unique name of this metric.
+	Name() string
+
+	// Refresh refreshes the metric values based on the current graph.
+	Refresh(graph ChannelGraph) error
+
+	// GetMetric returns the latest value of this metric. Values in the
+	// map are per node and can be in arbitrary domain. If normalize is
+	// set to true, then the returned values are normalized to either
+	// [0, 1] or [-1, 1] depending on the metric.
+	GetMetric(normalize bool) map[NodeID]float64
+}
+
+// ScoreSettable is an interface that indicates that the scores returned by the
+// heuristic can be mutated by an external caller. The ExternalScoreAttachment
+// currently implements this interface, and so should any heuristic that is
+// using the ExternalScoreAttachment as a sub-heuristic, or keeps their own
+// internal list of mutable scores, to allow access to setting the internal
+// scores.
+type ScoreSettable interface {
+	// SetNodeScores is used to set the internal map from NodeIDs to
+	// scores. The passed scores must be in the range [0, 1.0]. The fist
+	// parameter is the name of the targeted heuristic, to allow
+	// recursively target specific sub-heuristics. The returned boolean
+	// indicates whether the targeted heuristic was found.
+	SetNodeScores(string, map[NodeID]float64) (bool, error)
+}
+
+var (
+	// availableHeuristics holds all heuristics possible to combine for use
+	// with the autopilot agent.
+	availableHeuristics = []AttachmentHeuristic{
+		NewPrefAttachment(),
+		NewExternalScoreAttachment(),
+		NewTopCentrality(),
+	}
+
+	// AvailableHeuristics is a map that holds the name of available
+	// heuristics to the actual heuristic for easy lookup. It will be
+	// filled during init().
+	AvailableHeuristics = make(map[string]AttachmentHeuristic)
+)
+
+func init() {
+	// Fill the map from heuristic names to available heuristics for easy
+	// lookup.
+	for _, h := range availableHeuristics {
+		AvailableHeuristics[h.Name()] = h
+	}
 }
 
 // ChannelController is a simple interface that allows an auto-pilot agent to
 // open a channel within the graph to a target peer, close targeted channels,
 // or add/remove funds from existing channels via a splice in/out mechanisms.
 type ChannelController interface {
-	// OpenChannel opens a channel to a target peer, with a capacity of the
-	// specified amount. This function should un-block immediately after
-	// the funding transaction that marks the channel open has been
-	// broadcast.
-	OpenChannel(target *btcec.PublicKey, amt btcutil.Amount,
-		addrs []net.Addr) error
+	// OpenChannel opens a channel to a target peer, using at most amt
+	// funds. This means that the resulting channel capacity might be
+	// slightly less to account for fees. This function should un-block
+	// immediately after the funding transaction that marks the channel
+	// open has been broadcast.
+	OpenChannel(target *btcec.PublicKey, amt btcutil.Amount) error
 
 	// CloseChannel attempts to close out the target channel.
 	//

@@ -1,6 +1,8 @@
 package lnwire
 
-import "io"
+import (
+	"io"
+)
 
 // OnionPacketSize is the size of the serialized Sphinx onion packet included
 // in each UpdateAddHTLC message. The breakdown of the onion packet is as
@@ -66,7 +68,7 @@ var _ Message = (*UpdateAddHTLC)(nil)
 //
 // This is part of the lnwire.Message interface.
 func (c *UpdateAddHTLC) Decode(r io.Reader, pver uint32) error {
-	return readElements(r,
+	return ReadElements(r,
 		&c.ChanID,
 		&c.ID,
 		&c.Amount,
@@ -81,7 +83,7 @@ func (c *UpdateAddHTLC) Decode(r io.Reader, pver uint32) error {
 //
 // This is part of the lnwire.Message interface.
 func (c *UpdateAddHTLC) Encode(w io.Writer, pver uint32) error {
-	return writeElements(w,
+	return WriteElements(w,
 		c.ChanID,
 		c.ID,
 		c.Amount,
@@ -99,11 +101,19 @@ func (c *UpdateAddHTLC) MsgType() MessageType {
 	return MsgUpdateAddHTLC
 }
 
-// MaxPayloadLength returns the maximum allowed payload size for a UpdateAddHTLC
+// MaxPayloadLength returns the maximum allowed payload size for an UpdateAddHTLC
 // complete message observing the specified protocol version.
 //
 // This is part of the lnwire.Message interface.
 func (c *UpdateAddHTLC) MaxPayloadLength(uint32) uint32 {
 	// 1450
 	return 32 + 8 + 4 + 8 + 32 + 1366
+}
+
+// TargetChanID returns the channel id of the link for which this message is
+// intended.
+//
+// NOTE: Part of peer.LinkUpdater interface.
+func (c *UpdateAddHTLC) TargetChanID() ChannelID {
+	return c.ChanID
 }

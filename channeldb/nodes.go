@@ -6,9 +6,9 @@ import (
 	"net"
 	"time"
 
-	"github.com/boltdb/bolt"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/wire"
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/channeldb/kvdb"
 )
 
 var (
@@ -23,7 +23,7 @@ var (
 // channel open with. Information such as the Bitcoin network the node
 // advertised, and its identity public key are also stored. Additionally, this
 // struct and the bucket its stored within have store data similar to that of
-// Bitcion's addrmanager. The TCP address information stored within the struct
+// Bitcoin's addrmanager. The TCP address information stored within the struct
 // can be used to establish persistent connections will all channel
 // counterparties on daemon startup.
 //
@@ -54,9 +54,7 @@ type LinkNode struct {
 	// Addresses is a list of IP address in which either we were able to
 	// reach the node over in the past, OR we received an incoming
 	// authenticated connection for the stored identity public key.
-	//
-	// TODO(roasbeef): also need to support hidden service addrs
-	Addresses []*net.TCPAddr
+	Addresses []net.Addr
 
 	db *DB
 }
@@ -64,13 +62,13 @@ type LinkNode struct {
 // NewLinkNode creates a new LinkNode from the provided parameters, which is
 // backed by an instance of channeldb.
 func (db *DB) NewLinkNode(bitNet wire.BitcoinNet, pub *btcec.PublicKey,
-	addr *net.TCPAddr) *LinkNode {
+	addrs ...net.Addr) *LinkNode {
 
 	return &LinkNode{
 		Network:     bitNet,
 		IdentityPub: pub,
 		LastSeen:    time.Now(),
-		Addresses:   []*net.TCPAddr{addr},
+		Addresses:   addrs,
 		db:          db,
 	}
 }
@@ -85,7 +83,7 @@ func (l *LinkNode) UpdateLastSeen(lastSeen time.Time) error {
 
 // AddAddress appends the specified TCP address to the list of known addresses
 // this node is/was known to be reachable at.
-func (l *LinkNode) AddAddress(addr *net.TCPAddr) error {
+func (l *LinkNode) AddAddress(addr net.Addr) error {
 	for _, a := range l.Addresses {
 		if a.String() == addr.String() {
 			return nil
@@ -103,8 +101,8 @@ func (l *LinkNode) Sync() error {
 
 	// Finally update the database by storing the link node and updating
 	// any relevant indexes.
-	return l.db.Update(func(tx *bolt.Tx) error {
-		nodeMetaBucket := tx.Bucket(nodeInfoBucket)
+	return kvdb.Update(l.db, func(tx kvdb.RwTx) error {
+		nodeMetaBucket := tx.ReadWriteBucket(nodeInfoBucket)
 		if nodeMetaBucket == nil {
 			return ErrLinkNodesNotFound
 		}
@@ -116,7 +114,7 @@ func (l *LinkNode) Sync() error {
 // putLinkNode serializes then writes the encoded version of the passed link
 // node into the nodeMetaBucket. This function is provided in order to allow
 // the ability to re-use a database transaction across many operations.
-func putLinkNode(nodeMetaBucket *bolt.Bucket, l *LinkNode) error {
+func putLinkNode(nodeMetaBucket kvdb.RwBucket, l *LinkNode) error {
 	// First serialize the LinkNode into its raw-bytes encoding.
 	var b bytes.Buffer
 	if err := serializeLinkNode(&b, l); err != nil {
@@ -129,70 +127,108 @@ func putLinkNode(nodeMetaBucket *bolt.Bucket, l *LinkNode) error {
 	return nodeMetaBucket.Put(nodePub, b.Bytes())
 }
 
+// DeleteLinkNode removes the link node with the given identity from the
+// database.
+func (db *DB) DeleteLinkNode(identity *btcec.PublicKey) error {
+	return kvdb.Update(db, func(tx kvdb.RwTx) error {
+		return db.deleteLinkNode(tx, identity)
+	})
+}
+
+func (db *DB) deleteLinkNode(tx kvdb.RwTx, identity *btcec.PublicKey) error {
+	nodeMetaBucket := tx.ReadWriteBucket(nodeInfoBucket)
+	if nodeMetaBucket == nil {
+		return ErrLinkNodesNotFound
+	}
+
+	pubKey := identity.SerializeCompressed()
+	return nodeMetaBucket.Delete(pubKey)
+}
+
 // FetchLinkNode attempts to lookup the data for a LinkNode based on a target
 // identity public key. If a particular LinkNode for the passed identity public
 // key cannot be found, then ErrNodeNotFound if returned.
 func (db *DB) FetchLinkNode(identity *btcec.PublicKey) (*LinkNode, error) {
-	var (
-		node *LinkNode
-		err  error
-	)
-
-	err = db.View(func(tx *bolt.Tx) error {
-		// First fetch the bucket for storing node metadata, bailing
-		// out early if it hasn't been created yet.
-		nodeMetaBucket := tx.Bucket(nodeInfoBucket)
-		if nodeMetaBucket == nil {
-			return ErrLinkNodesNotFound
+	var linkNode *LinkNode
+	err := kvdb.View(db, func(tx kvdb.RTx) error {
+		node, err := fetchLinkNode(tx, identity)
+		if err != nil {
+			return err
 		}
 
-		// If a link node for that particular public key cannot be
-		// located, then exit early with a ErrNodeNotFound.
-		pubKey := identity.SerializeCompressed()
-		nodeBytes := nodeMetaBucket.Get(pubKey)
-		if nodeBytes == nil {
-			return ErrNodeNotFound
+		linkNode = node
+		return nil
+	})
+
+	return linkNode, err
+}
+
+func fetchLinkNode(tx kvdb.RTx, targetPub *btcec.PublicKey) (*LinkNode, error) {
+	// First fetch the bucket for storing node metadata, bailing out early
+	// if it hasn't been created yet.
+	nodeMetaBucket := tx.ReadBucket(nodeInfoBucket)
+	if nodeMetaBucket == nil {
+		return nil, ErrLinkNodesNotFound
+	}
+
+	// If a link node for that particular public key cannot be located,
+	// then exit early with an ErrNodeNotFound.
+	pubKey := targetPub.SerializeCompressed()
+	nodeBytes := nodeMetaBucket.Get(pubKey)
+	if nodeBytes == nil {
+		return nil, ErrNodeNotFound
+	}
+
+	// Finally, decode and allocate a fresh LinkNode object to be returned
+	// to the caller.
+	nodeReader := bytes.NewReader(nodeBytes)
+	return deserializeLinkNode(nodeReader)
+}
+
+// TODO(roasbeef): update link node addrs in server upon connection
+
+// FetchAllLinkNodes starts a new database transaction to fetch all nodes with
+// whom we have active channels with.
+func (db *DB) FetchAllLinkNodes() ([]*LinkNode, error) {
+	var linkNodes []*LinkNode
+	err := kvdb.View(db, func(tx kvdb.RTx) error {
+		nodes, err := db.fetchAllLinkNodes(tx)
+		if err != nil {
+			return err
 		}
 
-		// Finally, decode an allocate a fresh LinkNode object to be
-		// returned to the caller.
-		nodeReader := bytes.NewReader(nodeBytes)
-		node, err = deserializeLinkNode(nodeReader)
-		return err
+		linkNodes = nodes
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return node, nil
+	return linkNodes, nil
 }
 
-// FetchAllLinkNodes attempts to fetch all active LinkNodes from the database.
-// If there haven't been any channels explicitly linked to LinkNodes written to
-// the database, then this function will return an empty slice.
-func (db *DB) FetchAllLinkNodes() ([]*LinkNode, error) {
-	var linkNodes []*LinkNode
+// fetchAllLinkNodes uses an existing database transaction to fetch all nodes
+// with whom we have active channels with.
+func (db *DB) fetchAllLinkNodes(tx kvdb.RTx) ([]*LinkNode, error) {
+	nodeMetaBucket := tx.ReadBucket(nodeInfoBucket)
+	if nodeMetaBucket == nil {
+		return nil, ErrLinkNodesNotFound
+	}
 
-	err := db.View(func(tx *bolt.Tx) error {
-		nodeMetaBucket := tx.Bucket(nodeInfoBucket)
-		if nodeMetaBucket == nil {
-			return ErrLinkNodesNotFound
+	var linkNodes []*LinkNode
+	err := nodeMetaBucket.ForEach(func(k, v []byte) error {
+		if v == nil {
+			return nil
 		}
 
-		return nodeMetaBucket.ForEach(func(k, v []byte) error {
-			if v == nil {
-				return nil
-			}
+		nodeReader := bytes.NewReader(v)
+		linkNode, err := deserializeLinkNode(nodeReader)
+		if err != nil {
+			return err
+		}
 
-			nodeReader := bytes.NewReader(v)
-			linkNode, err := deserializeLinkNode(nodeReader)
-			if err != nil {
-				return err
-			}
-
-			linkNodes = append(linkNodes, linkNode)
-			return nil
-		})
+		linkNodes = append(linkNodes, linkNode)
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -227,8 +263,7 @@ func serializeLinkNode(w io.Writer, l *LinkNode) error {
 	}
 
 	for _, addr := range l.Addresses {
-		addrString := addr.String()
-		if err := wire.WriteVarString(w, 0, addrString); err != nil {
+		if err := serializeAddr(w, addr); err != nil {
 			return err
 		}
 	}
@@ -268,14 +303,9 @@ func deserializeLinkNode(r io.Reader) (*LinkNode, error) {
 	}
 	numAddrs := byteOrder.Uint32(buf[:4])
 
-	node.Addresses = make([]*net.TCPAddr, numAddrs)
+	node.Addresses = make([]net.Addr, numAddrs)
 	for i := uint32(0); i < numAddrs; i++ {
-		addrString, err := wire.ReadVarString(r, 0)
-		if err != nil {
-			return nil, err
-		}
-
-		addr, err := net.ResolveTCPAddr("tcp", addrString)
+		addr, err := deserializeAddr(r)
 		if err != nil {
 			return nil, err
 		}
